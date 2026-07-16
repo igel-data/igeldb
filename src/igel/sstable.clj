@@ -54,14 +54,14 @@
       (.lock read-lock)
       (try
         (loop [tables (reverse (reduce into [] @sstables))]
-          (let [[id table] (first tables)
-                hit? (blossom/hit? (:bloom-filter table) k)
-                sstable-path (get-sstable-path id dir)
-                v (io/read-value sstable-path k)]
-            (if (and table hit? v)
+          ;; Stop once the tables are exhausted: return nil without touching
+          ;; the disk. Only read a value when the Bloom filter reports a hit,
+          ;; so a negative filter never triggers a file read.
+          (when-let [[id table] (first tables)]
+            (if-let [v (and (blossom/hit? (:bloom-filter table) k)
+                            (io/read-value (get-sstable-path id dir) k))]
               v
-              (when id
-                (recur (next tables))))))
+              (recur (next tables)))))
         (finally (.unlock read-lock)))))
   (scan
     [_ from-key to-key]

@@ -109,6 +109,19 @@
                  "\n  actual:   " actual-results))))
     (delete-test-dir! (io/file data-dir) false)))
 
+(deftest empty-store-select-test
+  ;; A fresh store has no SSTables at all. `select`/`scan` on a missing key must
+  ;; return nil / empty rather than throwing (a FileNotFoundException on the
+  ;; nonexistent "dir/.sst" path used to escape when the table list was empty).
+  (let [data-dir (str "./test-data/empty-store-select-test")
+        test-config (make-test-config data-dir)
+        config-path (setup-test! data-dir test-config)
+        kvs (igel/gen-kvs config-path)]
+    (is (nil? (igel/select kvs (.getBytes "no-such-key"))))
+    (is (empty? (igel/scan kvs (.getBytes "a") (.getBytes "z"))))
+    (.finalize kvs)
+    (delete-test-dir! (io/file data-dir) false)))
+
 (deftest restore-test
   (let [data-dir (str "./test-data/restore-test")
         test-config (make-test-config data-dir)

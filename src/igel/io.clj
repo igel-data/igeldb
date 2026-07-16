@@ -72,13 +72,13 @@
   If the data length is zero, it returns nil."
   [^BufferedInputStream in-stream]
   (let [buf (make-array Byte/TYPE LEN_SIZE)
-        read-len (.read in-stream buf 0 LEN_SIZE)
+        read-len (.readNBytes in-stream buf 0 LEN_SIZE)
         data-len (deserialize-long buf)]
     (when (and (= read-len LEN_SIZE) (> data-len 0))
       (let [buf (make-array Byte/TYPE data-len)
-            read-len (.read in-stream buf 0 data-len)
+            read-len (.readNBytes in-stream buf 0 data-len)
             crc-buf (make-array Byte/TYPE CRC_SIZE)
-            crc-len (.read in-stream crc-buf 0 CRC_SIZE)]
+            crc-len (.readNBytes in-stream crc-buf 0 CRC_SIZE)]
         ;; TODO throw an exception when unexpected length or crc error
         (when (and (= read-len data-len)
                    (= crc-len CRC_SIZE)
