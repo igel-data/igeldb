@@ -47,14 +47,16 @@
   (if (zero? (-> @memtable :size deref))
     ;; no flush
     (async/go
-      (async/>! flush-wal-chan [@sstable-id (:wal-chan @memtable)]))
+      (async/>! flush-wal-chan [@sstable-id @memtable]))
     ;; flush and update the memtable and the sstables
     (let [new-id @sstable-id
           wal-chan (async/chan)
           table-info (-> (switch-memtable! memtable wal-chan)
                          (flush-memtable! new-id config))]
-      ;; Send a new WAL ID and wal-chan to the WAL writer to receive new requests
-      (async/>!! flush-wal-chan [(+ @sstable-id 2) wal-chan])
+      ;; Send the new WAL ID and the new memtable generation to the WAL writer.
+      ;; `switch-memtable!` has already installed it as `@memtable`; the worker
+      ;; reads its wal-chan, memstore and size from it.
+      (async/>!! flush-wal-chan [(+ @sstable-id 2) @memtable])
       ;; Update the tree
       (sstable/add-new-table! tree new-id table-info)
       ;; The previous WAL can be deleted
@@ -69,18 +71,19 @@
     (flush! memtable tree sstable-id flush-wal-chan config))
   ;; TODO: error handling
   (let [threshold (:memtable-size config)]
-    (async/go-loop [shutdown? false]
+    (async/go-loop []
       (case (async/<! req-chan)
         :flush (do
                  (flush! memtable tree sstable-id flush-wal-chan config)
-                 (when-not shutdown? (recur false)))
+                 (recur))
         :try-flush (do
                      (when (> (deref (:size @memtable)) threshold)
                        ;; close the data channel not to send data to the WAL thread
                        (async/close! (:wal-chan @memtable)))
-                     (recur false))
-        ;; when nil
-        (do
-          ;; close the data channel not to send data to the WAL thread
-          (async/close! (:wal-chan @memtable))
-          (recur true))))))
+                     (recur))
+        ;; nil: `req-chan` was closed -> shutdown. Close the WAL channel so the
+        ;; worker drains and fsyncs any buffered entries; those are recovered
+        ;; from the WAL by replay on restart. Then END the loop (no `recur`):
+        ;; recurring here would re-read the closed `req-chan`, get nil again,
+        ;; and busy-loop a CPU core for the lifetime of the JVM.
+        (async/close! (:wal-chan @memtable))))))

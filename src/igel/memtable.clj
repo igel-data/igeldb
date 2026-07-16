@@ -27,6 +27,9 @@
   (write!
     [_ k v]
     (.put mem k (data/new-data v)))
+  (write-data!
+    [_ k data]
+    (.put mem k data))
   (delete!
     [_ k]
     (.put mem k (data/deleted-data))))
@@ -44,32 +47,35 @@
       (scan mem from-key to-key)))
 
   store/IStoreMutate
+  ;; Writers only enqueue to the WAL channel and wait for the group-commit
+  ;; worker to signal completion. The worker (a single thread) appends to the
+  ;; WAL, fsyncs, then applies the entry to the memtable and updates `size` --
+  ;; the writer never touches the memtable or holds a lock across the fsync.
+  ;; This keeps WAL-append order == memtable-apply order and makes rollback on
+  ;; fsync failure unnecessary (nothing is applied until fsync succeeds).
   (write!
     [_ k v]
-    (locking mem
-      (let [comp-chan (async/chan)]
-        (when-not (async/>!! wal-chan [k (data/new-data v) comp-chan])
-          (throw (ex-info "Write failed due to memtable switching"
-                          {:retriable true})))
-        (write! mem k v)
-        (case (async/<!! comp-chan)
-          :done (swap! size (partial + (count k) (count v)))
-          nil (throw (ex-info "Write failed due to memtable switching"
-                              {:retriable true}))
-          (throw (ex-info "Write failed" {:retriable false}))))))
+    (let [comp-chan (async/chan)]
+      (when-not (async/>!! wal-chan [k (data/new-data v) comp-chan])
+        (throw (ex-info "Write failed due to memtable switching"
+                        {:retriable true})))
+      (case (async/<!! comp-chan)
+        :done nil
+        nil (throw (ex-info "Write failed due to memtable switching"
+                            {:retriable true}))
+        (throw (ex-info "Write failed" {:retriable false})))))
+  (write-data! [_ _ _] (throw (UnsupportedOperationException.)))
   (delete!
     [_ k]
-    (locking mem
-      (let [comp-chan (async/chan)]
-        (when-not (async/>!! wal-chan [k (data/deleted-data) comp-chan])
-          (throw (ex-info "Delete failed due to memtable switching"
-                          {:retriable true})))
-        (delete! mem k)
-        (case (async/<!! comp-chan)
-          :done (swap! size (partial + (count k)))
-          nil (throw (ex-info "Delete failed due to memtable switching"
-                              {:retriable true}))
-          (throw (ex-info "Delete failed" {:retriable false})))))))
+    (let [comp-chan (async/chan)]
+      (when-not (async/>!! wal-chan [k (data/deleted-data) comp-chan])
+        (throw (ex-info "Delete failed due to memtable switching"
+                        {:retriable true})))
+      (case (async/<!! comp-chan)
+        :done nil
+        nil (throw (ex-info "Delete failed due to memtable switching"
+                            {:retriable true}))
+        (throw (ex-info "Delete failed" {:retriable false}))))))
 
 (defn create-memtable
   "Create the new memtable"

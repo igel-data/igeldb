@@ -3,7 +3,8 @@
             [clojure.java.io :as io]
             [clj-yaml.core :as yaml]
             [igel.core :as igel]
-            [igel.data :as data]))
+            [igel.data :as data]
+            [igel.wal :as wal]))
 
 ;; If this env var is true, test directories will be left for debugging
 (def ^:private ^:const LEAVE_TEST_DIR "LEAVE_TEST_DIR")
@@ -13,7 +14,9 @@
   {:sstable-dir (str data-dir "/sstable")
    :wal-dir (str data-dir "/wal")
    :memtable-size 1024
-   :sync-window-time 200})
+   ;; Small window keeps single-threaded tests fast: a lone writer never fills a
+   ;; group-commit batch, so each write waits at most this long for its fsync.
+   :sync-window-time 20})
 
 (defn- delete-test-dir!
   [file-or-dir force?]
@@ -148,3 +151,76 @@
                                       "nil"
                                       (String. actual)))))))
     (delete-test-dir! (io/file data-dir) false)))
+
+(deftest concurrent-distinct-keys-test
+  ;; Many threads writing distinct keys concurrently. Every write must be
+  ;; applied to the memtable (no lost updates), and the group-commit worker must
+  ;; batch multiple entries per fsync rather than one fsync per write.
+  (let [data-dir (str "./test-data/concurrent-distinct-keys-test")
+        num-threads 32
+        per-thread 20
+        num-writes (* num-threads per-thread)
+        test-config (assoc (make-test-config data-dir)
+                           ;; large memtable so no flush interferes with the
+                           ;; fsync count; wide window so concurrent writers
+                           ;; accumulate into shared batches.
+                           :memtable-size (* 1024 1024)
+                           :sync-window-time 100
+                           :group-commit-limit 100000)
+        config-path (setup-test! data-dir test-config)
+        kvs (igel/gen-kvs config-path)]
+    (reset! wal/fsync-count 0)
+    (let [fs (doall
+              (for [t (range num-threads)]
+                (future
+                  (doseq [i (range per-thread)]
+                    (igel/write! kvs
+                                 (.getBytes (str "k-" t "-" i))
+                                 (.getBytes (str "v-" t "-" i)))))))]
+      (doseq [f fs] @f))
+    ;; every write is visible
+    (doseq [t (range num-threads)
+            i (range per-thread)]
+      (let [expected (.getBytes (str "v-" t "-" i))
+            actual (igel/select kvs (.getBytes (str "k-" t "-" i)))]
+        (is (data/byte-array-equals? expected actual)
+            (str "Lost concurrent write for k-" t "-" i))))
+    ;; group commit batched: average batch size >= 2 (a single fsync per write
+    ;; would give fsync-count == num-writes).
+    (is (< (* 2 @wal/fsync-count) num-writes)
+        (str "Group commit did not batch: fsyncs=" @wal/fsync-count
+             " writes=" num-writes))
+    (.finalize kvs)
+    (delete-test-dir! (io/file data-dir) false)))
+
+(deftest concurrent-same-key-invariant-test
+  ;; For concurrent writes to the SAME key, the WAL-append order and the
+  ;; memtable-apply order are identical (a single worker thread does both), so
+  ;; the value observed before a crash must equal the value after WAL replay.
+  ;; We verify this directly: race writers on one key, read the winner, restart
+  ;; (forcing a WAL replay), and confirm the value is unchanged.
+  (dotimes [round 3]
+    (let [data-dir (str "./test-data/concurrent-same-key-" round)
+          test-config (make-test-config data-dir)
+          config-path (setup-test! data-dir test-config)
+          k (.getBytes "hot-key")
+          num-threads 16
+          before (let [kvs (igel/gen-kvs config-path)]
+                   (let [fs (doall
+                             (for [t (range num-threads)]
+                               (future
+                                 (igel/write! kvs k (.getBytes (str "val-" t))))))]
+                     (doseq [f fs] @f))
+                   (let [v (igel/select kvs k)]
+                     (.finalize kvs)
+                     v))]
+      (is (some? before) "A concurrent write to the key should have survived")
+      ;; restart -> replay the WAL -> the surviving value must be identical
+      (let [kvs (igel/gen-kvs config-path)
+            after (igel/select kvs k)]
+        (is (data/byte-array-equals? before after)
+            (str "Value diverged across restart (round " round "): before="
+                 (when before (String. before))
+                 " after=" (when after (String. after))))
+        (.finalize kvs))
+      (delete-test-dir! (io/file data-dir) false))))

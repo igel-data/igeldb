@@ -11,4 +11,8 @@
 (defprotocol IStoreMutate
   "Interface for mutations to the data store"
   (write! [this ^bytes k ^bytes v])
+  ;; Apply an already-built `data/Data` record (a value or a tombstone).
+  ;; Used by the group-commit worker to apply a batch to the memtable after
+  ;; the WAL fsync completes, preserving the exact data enqueued by the writer.
+  (write-data! [this ^bytes k data])
   (delete! [this ^bytes k]))

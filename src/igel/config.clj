@@ -4,6 +4,7 @@
 
 (def ^:private ^:const DEFAULT_MEMTABLE_SIZE 1024)
 (def ^:private ^:const DEFAULT_SYNC_WINDOW_TIME 200)
+(def ^:private ^:const DEFAULT_GROUP_COMMIT_LIMIT 64)
 (def ^:private ^:const DEFAULT_WRITE_RETRIES 10)
 (def ^:private ^:const DEFAULT_BLOOM_FILTER {:size 10240})
 
@@ -18,6 +19,7 @@
   (let [config (read-config config-path)
         default {:memtable-size DEFAULT_MEMTABLE_SIZE
                  :sync-window-time DEFAULT_SYNC_WINDOW_TIME
+                 :group-commit-limit DEFAULT_GROUP_COMMIT_LIMIT
                  :write-retries DEFAULT_WRITE_RETRIES
                  :bloom-filter DEFAULT_BLOOM_FILTER}
         result (merge default config)]
@@ -32,5 +34,9 @@
     (when (not (pos? (:sync-window-time result)))
       (throw (ex-info
               "`sync-window-time` should be positive in the config"
+              result)))
+    (when-not (pos? (:group-commit-limit result))
+      (throw (ex-info
+              "`group-commit-limit` should be positive in the config"
               result)))
     result))
