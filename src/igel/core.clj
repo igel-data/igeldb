@@ -10,21 +10,26 @@
             [igel.wal :as wal])
   (:gen-class))
 
-(defrecord BgWorkers [wal-handler flush-writer flush-req-chan])
+;; `poison` holds the fatal exception once an IO error trips fail-stop (nil while
+;; healthy). The WAL worker and flush writer set it; every write/delete checks it.
+(defrecord BgWorkers [wal-handler flush-writer flush-req-chan poison])
 
 (defn spawn-bg-workers
   [memtable tree sstable-id config]
   (let [flush-req-chan (async/chan)
-        flush-wal-chan (async/chan)]
+        flush-wal-chan (async/chan)
+        poison (atom nil)]
     (->BgWorkers
-     (f/spawn-flush-writer memtable tree sstable-id
+     (f/spawn-flush-writer memtable tree sstable-id poison
                            flush-req-chan
                            flush-wal-chan
                            config)
-     (wal/spawn-wal-writer flush-req-chan
+     (wal/spawn-wal-writer poison
+                           flush-req-chan
                            flush-wal-chan
                            config)
-     flush-req-chan)))
+     flush-req-chan
+     poison)))
 
 (defn- terminate-flush-writer
   [coordinator]
@@ -57,6 +62,41 @@
                                        m-pairs (rest t-pairs)])]
         (recur updated m-rest t-rest)))))
 
+(defn- run-mutation!
+  "Run a memtable mutation, applying the two settled error classes:
+
+  - Class B (fail-stop): if the store has been poisoned by an IO error, reject
+    the mutation immediately, and also if it becomes poisoned mid-flight. The
+    original fsync/flush failure is preserved as the exception cause.
+  - Class C (retriable): a collision with a memtable switch throws
+    {:retriable true}; retry up to `write-retries` times, then give up. The last
+    retriable failure is preserved as the cause.
+
+  Non-retriable exceptions propagate unchanged. `op` is :write or :delete,
+  used only for the message."
+  [poison config op mutate!]
+  (loop [retries (:write-retries config)
+         last-err nil]
+    (when-let [e @poison]
+      (throw (ex-info (str (name op) " rejected: the store is poisoned")
+                      {:retriable false} e)))
+    (let [err (try
+                (mutate!)
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  (cond
+                    @poison
+                    (throw (ex-info (str (name op) " failed: the store is poisoned")
+                                    {:retriable false} @poison))
+                    (-> e ex-data :retriable) e
+                    :else (throw e))))]
+      (when err
+        (if (pos? retries)
+          (do (Thread/sleep 100)
+              (recur (dec retries) err))
+          (throw (ex-info (str (name op) " failed repeatedly")
+                          {:retriable false} err)))))))
+
 (defrecord KVS [config memtable tree workers]
   store/IStoreRead
   (select
@@ -73,34 +113,13 @@
   store/IStoreMutate
   (write!
     [_ k v]
-    (loop [retries (:write-retries config)]
-      (if (try
-            (store/write! @memtable k v)
-            false ;; break the loop when it succeeded
-            (catch Exception e
-              (when-not (-> e ex-data :retriable)
-                (throw (ex-info "Write failed" {:retriable false})))
-              (pos? retries)))
-        (do
-          (Thread/sleep 100)
-          (recur (dec retries)))
-        (when (zero? retries)
-          (throw (ex-info "Write failed repeatedly" {:retriable false}))))))
+    (run-mutation! (:poison workers) config :write
+                   #(store/write! @memtable k v)))
   (delete!
     [_ k]
-    (loop [retries (:write-retries config)]
-      (if (try
-            (store/delete! @memtable k)
-            false ;; break the loop when it succeeded
-            (catch Exception e
-              (when-not (-> e ex-data :retriable)
-                (throw (ex-info "Delete failed" {:retriable false})))
-              (pos? retries)))
-        (do
-          (Thread/sleep 100)
-          (recur (dec retries)))
-        (when (zero? retries)
-          (throw (ex-info "Delete failed repeatedly" {:retriable false}))))))
+    (run-mutation! (:poison workers) config :delete
+                   #(store/delete! @memtable k)))
+  (write-data! [_ _ _] (throw (UnsupportedOperationException.)))
 
   Object
   (finalize [_]

@@ -68,52 +68,102 @@
     (write-bytes! out-stream (:value data))))
 
 (defn read-data!
-  "Return the byte-array of the data segment from the input stream.
-  If the data length is zero, it returns nil."
+  "Read one length-prefixed, CRC-checked data segment, classifying the outcome
+  so callers can distinguish the four error classes. Returns one of:
+
+    :eof        - a clean end at a record boundary (nothing left to read)
+    :truncated  - an incomplete entry: EOF was reached partway through the
+                  length prefix, the data, or the CRC. Normal only at a WAL
+                  tail (a crash before the write's fsync completed).
+    :tombstone  - a deletion marker (segment length 0)
+    :corrupt    - the whole segment was read but its CRC did not match, or the
+                  length prefix is nonsensical (mid-file corruption)
+    {:ok bytes} - a valid data segment"
   [^BufferedInputStream in-stream]
-  (let [buf (make-array Byte/TYPE LEN_SIZE)
-        read-len (.readNBytes in-stream buf 0 LEN_SIZE)
-        data-len (deserialize-long buf)]
-    (when (and (= read-len LEN_SIZE) (> data-len 0))
-      (let [buf (make-array Byte/TYPE data-len)
-            read-len (.readNBytes in-stream buf 0 data-len)
-            crc-buf (make-array Byte/TYPE CRC_SIZE)
-            crc-len (.readNBytes in-stream crc-buf 0 CRC_SIZE)]
-        ;; TODO throw an exception when unexpected length or crc error
-        (when (and (= read-len data-len)
-                   (= crc-len CRC_SIZE)
-                   (valid-data? buf (deserialize-long crc-buf)))
-          buf)))))
+  (let [len-buf (make-array Byte/TYPE LEN_SIZE)
+        len-read (.readNBytes in-stream len-buf 0 LEN_SIZE)]
+    (cond
+      (zero? len-read) :eof
+      (< len-read LEN_SIZE) :truncated
+      :else
+      (let [data-len (deserialize-long len-buf)]
+        (cond
+          (zero? data-len) :tombstone
+          (neg? data-len) :corrupt
+          :else
+          (let [data-buf (make-array Byte/TYPE data-len)
+                data-read (.readNBytes in-stream data-buf 0 data-len)
+                crc-buf (make-array Byte/TYPE CRC_SIZE)
+                crc-read (.readNBytes in-stream crc-buf 0 CRC_SIZE)]
+            (cond
+              (or (< data-read data-len) (< crc-read CRC_SIZE)) :truncated
+              (valid-data? data-buf (deserialize-long crc-buf)) {:ok data-buf}
+              :else :corrupt)))))))
+
+(defn read-bytes!
+  "Read a data segment that is required to be present and valid, e.g. a field of
+  a fixed-format file (SSTable info). Throws on any EOF/truncation/corruption."
+  [^BufferedInputStream in-stream file-path]
+  (let [r (read-data! in-stream)]
+    (if (map? r)
+      (:ok r)
+      (throw (ex-info "Corrupted or truncated file segment"
+                      {:file (str file-path) :reason r})))))
 
 (defn read-kv-pair!
+  "Read one key-value entry (key segment then value segment). Returns:
+    :eof        - a clean end at a record boundary
+    :truncated  - an incomplete entry at the tail
+    :corrupt    - a CRC mismatch (mid-file corruption)
+    [k data]    - a complete entry; `data` is a `data/Data` (value or tombstone)"
   [^BufferedInputStream in-stream]
-  [(read-data! in-stream) (read-data! in-stream)])
+  (let [k (read-data! in-stream)]
+    (if (map? k)
+      (let [v (read-data! in-stream)]
+        (cond
+          (map? v) [(:ok k) (data/new-data (:ok v))]
+          (= :tombstone v) [(:ok k) (data/deleted-data)]
+          (= :corrupt v) :corrupt
+          ;; :eof or :truncated after a key = an incomplete entry
+          :else :truncated))
+      ;; key segment itself terminated the read (or was invalid):
+      ;; :eof -> clean end; :truncated -> incomplete; a zero-length key
+      ;; (:tombstone) is not valid and is treated as corruption.
+      (case k
+        :eof :eof
+        :truncated :truncated
+        :corrupt))))
 
 (defn read-value
   [file-path target-key]
   (with-open [in-stream (io/input-stream file-path)]
     (loop []
-      (let [[k v] (read-kv-pair! in-stream)]
-        (if (data/byte-array-equals? k target-key)
-          (if (nil? v)
-            (data/deleted-data)
-            (data/new-data v))
-          (if (nil? k) nil (recur)))))))
+      (let [entry (read-kv-pair! in-stream)]
+        (case entry
+          :eof nil
+          ;; SSTables are fsynced, so any corruption or truncation there is real.
+          (:truncated :corrupt)
+          (throw (ex-info "SSTable is corrupted"
+                          {:file (str file-path) :reason entry}))
+          (let [[k data] entry]
+            (if (data/byte-array-equals? k target-key)
+              data
+              (recur))))))))
 
 (defn scan-pairs
   [file-path from-key to-key]
   (with-open [in-stream (io/input-stream file-path)]
     (loop [pairs (transient [])]
-      (let [[k v] (read-kv-pair! in-stream)
-            data (cond
-                   (and (seq k) (seq v)) (data/new-data v)
-                   (and (seq k) (nil? v)) (data/deleted-data)
-                   :else nil)]
-        (if (nil? k)
-          (persistent! pairs)
-          (if (data/byte-array-smaller-or-equal? to-key k)
-            (persistent! pairs)
-            (recur
-             (if (data/byte-array-smaller-or-equal? from-key k)
-               (conj! pairs [k data])
-               pairs))))))))
+      (let [entry (read-kv-pair! in-stream)]
+        (case entry
+          :eof (persistent! pairs)
+          (:truncated :corrupt)
+          (throw (ex-info "SSTable is corrupted"
+                          {:file (str file-path) :reason entry}))
+          (let [[k data] entry]
+            (if (data/byte-array-smaller-or-equal? to-key k)
+              (persistent! pairs)
+              (recur
+               (if (data/byte-array-smaller-or-equal? from-key k)
+                 (conj! pairs [k data])
+                 pairs)))))))))

@@ -90,7 +90,11 @@
   (let [store (->MemStore (new java.util.TreeMap (data/byte-array-comparator)))
         wal-pairs (wal/load-existing-wal config)
         memtable-size (if (empty? wal-pairs) 0 (:memtable-size config))]
-    (mapv #(apply write! store %) wal-pairs)
+    ;; `load-existing-wal` returns [k data] entries (data is a value or a
+    ;; tombstone). Apply them in WAL order so the replayed memtable matches the
+    ;; pre-crash state.
+    (doseq [[k data] wal-pairs]
+      (store/write-data! store k data))
     (->Memtable store wal-chan (atom memtable-size))))
 
 (defn entry-set

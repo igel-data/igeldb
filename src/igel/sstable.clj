@@ -33,11 +33,13 @@
 (defn read-table-info
   [file-path {:keys [bloom-filter]}]
   (with-open [in-stream (java-io/input-stream file-path)]
-    [(-> (io/read-data! in-stream) io/deserialize-long)
-     (->TableInfo
-      (blossom/deserialize-filter (io/read-data! in-stream) bloom-filter)
-      (io/read-data! in-stream)
-      (io/read-data! in-stream))]))
+    ;; Every field is required; `read-bytes!` throws on any corruption/truncation.
+    (let [level (io/deserialize-long (io/read-bytes! in-stream file-path))
+          bf (blossom/deserialize-filter (io/read-bytes! in-stream file-path)
+                                         bloom-filter)
+          head-key (io/read-bytes! in-stream file-path)
+          tail-key (io/read-bytes! in-stream file-path)]
+      [level (->TableInfo bf head-key tail-key)])))
 
 ;; SSTable is managed as `[table-id TableInfo]`.
 ;; The `sstables` in TreeStore have them grouped by levels.

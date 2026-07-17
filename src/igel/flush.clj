@@ -65,25 +65,33 @@
       (swap! sstable-id (partial + 2)))))
 
 (defn spawn-flush-writer
-  [memtable tree sstable-id req-chan flush-wal-chan config]
-  ;; first flush
-  (async/go
-    (flush! memtable tree sstable-id flush-wal-chan config))
-  ;; TODO: error handling
-  (let [threshold (:memtable-size config)]
-    (async/go-loop []
-      (case (async/<! req-chan)
-        :flush (do
-                 (flush! memtable tree sstable-id flush-wal-chan config)
-                 (recur))
-        :try-flush (do
-                     (when (> (deref (:size @memtable)) threshold)
-                       ;; close the data channel not to send data to the WAL thread
-                       (async/close! (:wal-chan @memtable)))
-                     (recur))
-        ;; nil: `req-chan` was closed -> shutdown. Close the WAL channel so the
-        ;; worker drains and fsyncs any buffered entries; those are recovered
-        ;; from the WAL by replay on restart. Then END the loop (no `recur`):
-        ;; recurring here would re-read the closed `req-chan`, get nil again,
-        ;; and busy-loop a CPU core for the lifetime of the JVM.
-        (async/close! (:wal-chan @memtable))))))
+  [memtable tree sstable-id poison req-chan flush-wal-chan config]
+  (letfn [(safe-flush! []
+            ;; Fail-stop (3-3): a flush failure poisons the store just like an
+            ;; fsync failure. If the go-loop died silently instead, nothing
+            ;; would ever flush again and the memtable would grow unbounded.
+            ;; Returns true on success, false once poisoned.
+            (try
+              (flush! memtable tree sstable-id flush-wal-chan config)
+              true
+              (catch Throwable e
+                (reset! poison e)
+                (logging/error e "Flush writer failed; the store is poisoned")
+                false)))]
+    ;; first flush
+    (async/go (safe-flush!))
+    (let [threshold (:memtable-size config)]
+      (async/go-loop []
+        (case (async/<! req-chan)
+          :flush (when (safe-flush!) (recur))
+          :try-flush (do
+                       (when (> (deref (:size @memtable)) threshold)
+                         ;; close the data channel not to send data to the WAL thread
+                         (async/close! (:wal-chan @memtable)))
+                       (recur))
+          ;; nil: `req-chan` was closed -> shutdown. Close the WAL channel so the
+          ;; worker drains and fsyncs any buffered entries; those are recovered
+          ;; from the WAL by replay on restart. Then END the loop (no `recur`):
+          ;; recurring here would re-read the closed `req-chan`, get nil again,
+          ;; and busy-loop a CPU core for the lifetime of the JVM.
+          (async/close! (:wal-chan @memtable)))))))
