@@ -12,15 +12,18 @@
 
 ;; `poison` holds the fatal exception once an IO error trips fail-stop (nil while
 ;; healthy). The WAL worker and flush writer set it; every write/delete checks it.
-(defrecord BgWorkers [wal-handler flush-writer flush-req-chan poison])
+;; `ready` is delivered once the initial flush has established the first WAL
+;; generation (true on success, false if poisoned during init).
+(defrecord BgWorkers [wal-handler flush-writer flush-req-chan poison ready])
 
 (defn spawn-bg-workers
-  [memtable tree sstable-id config]
+  [memtable tree sstable-id wal-id config]
   (let [flush-req-chan (async/chan)
         flush-wal-chan (async/chan)
-        poison (atom nil)]
+        poison (atom nil)
+        ready (promise)]
     (->BgWorkers
-     (f/spawn-flush-writer memtable tree sstable-id poison
+     (f/spawn-flush-writer memtable tree sstable-id wal-id poison ready
                            flush-req-chan
                            flush-wal-chan
                            config)
@@ -29,7 +32,8 @@
                            flush-wal-chan
                            config)
      flush-req-chan
-     poison)))
+     poison
+     ready)))
 
 (defn- terminate-flush-writer
   [coordinator]
@@ -128,19 +132,20 @@
 
 ;; ==== Main APIs ====
 
+(def ^:private ^:const INIT_TIMEOUT_MS 30000)
+
 (defn gen-kvs
   [config-path]
   (let [config (config/load-config config-path)
         [tree sstable-id] (restore-tree-store config)
-        memtable (atom (init-memtable (async/chan) config))
-        workers (spawn-bg-workers memtable tree (atom sstable-id) config)]
-    ;; wait for the first flush by checking the memtable size
-    (loop [retries (:write-retries config)]
-      (if (zero? retries)
-        (throw (ex-info "Initializing KVS failed" {:retriable true}))
-        (when (pos? (-> @memtable :size deref))
-          (Thread/sleep 1000)
-          (recur (dec retries)))))
+        [wal-id memtable-val] (init-memtable (async/chan) config)
+        memtable (atom memtable-val)
+        workers (spawn-bg-workers memtable tree (atom sstable-id) (atom wal-id)
+                                  config)]
+    ;; Block until the initial flush has established the first WAL generation
+    ;; (and, on restart, committed the replayed WAL to an SSTable).
+    (when-not (true? (deref (:ready workers) INIT_TIMEOUT_MS :timeout))
+      (throw (ex-info "Initializing KVS failed" {} @(:poison workers))))
     (->KVS config memtable tree workers)))
 
 (defn select

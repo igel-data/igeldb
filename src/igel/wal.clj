@@ -18,35 +18,62 @@
   [^long id config]
   (str (:wal-dir config) \/ id ".wal"))
 
-(defn load-existing-wal
-  [config]
-  (let [wal-file (->> (:wal-dir config)
-                      io/list-files
-                      (filter #(and (.isFile %)
-                                    (.endsWith (.getName %) ".wal")))
-                      first)]
-    (when-not (nil? wal-file)
-      (with-open [in-stream (java-io/input-stream wal-file)]
-        (loop [result (transient [])]
-          (let [entry (io/read-kv-pair! in-stream)]
-            (case entry
-              ;; clean end of the log
-              :eof (persistent! result)
-              ;; An incomplete entry at the tail is expected: the process died
-              ;; before this write's fsync completed. Keep everything before it.
-              :truncated
-              (do
-                (logging/warn "Discarding an incomplete tail entry in WAL"
-                              (.getName wal-file))
-                (persistent! result))
-              ;; A CRC mismatch mid-file is real corruption, not a torn tail.
-              :corrupt
-              (throw (ex-info "WAL is corrupted (CRC mismatch)"
-                              {:file (.getName wal-file)}))
-              ;; entry is [k data]
-              (recur (conj! result entry)))))))))
+(defn- wal-file-id
+  "The numeric ID encoded in a `<id>.wal` filename."
+  [file]
+  (Long/parseLong (re-find #"\d+" (.getName file))))
 
-(defn- entry-size
+(defn- replay-wal
+  "Replay one WAL file into a vector of [k data] entries."
+  [wal-file]
+  (with-open [in-stream (java-io/input-stream wal-file)]
+    (loop [result (transient [])]
+      (let [entry (io/read-kv-pair! in-stream)]
+        (case entry
+          ;; clean end of the log
+          :eof (persistent! result)
+          ;; An incomplete entry at the tail is expected: the process died
+          ;; before this write's fsync completed. Keep everything before it.
+          :truncated
+          (do
+            (logging/warn "Discarding an incomplete tail entry in WAL"
+                          (.getName wal-file))
+            (persistent! result))
+          ;; A CRC mismatch mid-file is real corruption, not a torn tail.
+          :corrupt
+          (throw (ex-info "WAL is corrupted (CRC mismatch)"
+                          {:file (.getName wal-file)}))
+          ;; entry is [k data]
+          (recur (conj! result entry)))))))
+
+(defn load-existing-wal
+  "Return `[wal-id entries]` for crash recovery.
+
+  Crash-recovery invariant: every WAL other than the highest-ID one has already
+  been committed to an SSTable (flush commits the SSTable before deleting the
+  WAL). So multiple WALs remaining is the *normal* result of crashing after a
+  flush's SSTable commit but before the WAL delete -- it must not be treated as
+  an error. We replay only the highest-ID WAL and discard the stale ones.
+
+  When no WAL exists, the WAL ID starts at 0 with no entries."
+  [config]
+  (let [wal-files (->> (:wal-dir config)
+                       io/list-files
+                       (filter #(and (.isFile %)
+                                     (.endsWith (.getName %) ".wal")))
+                       (sort-by wal-file-id))]
+    (if (empty? wal-files)
+      [0 []]
+      (let [newest (last wal-files)
+            stale (butlast wal-files)]
+        (when (seq stale)
+          (logging/info (str "Restoring from WAL " (wal-file-id newest)
+                             ", discarding stale WALs "
+                             (mapv wal-file-id stale)))
+          (doseq [f stale] (io/delete-file f)))
+        [(wal-file-id newest) (replay-wal newest)]))))
+
+(defn entry-size
   "Byte size an entry contributes to the memtable: the key plus, for a live
   value, the value bytes. A tombstone contributes only the key."
   [^bytes k data]

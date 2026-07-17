@@ -8,11 +8,17 @@
 
 (def ^:private ^:const TMP_DIR "test-data/io-test")
 
+(defn- delete-recursively!
+  [file]
+  (when (.isDirectory file)
+    (doseq [c (.listFiles file)] (delete-recursively! c)))
+  (.delete file))
+
 (use-fixtures :each
   (fn [t]
     (io/make-dir TMP_DIR)
     (t)
-    (doseq [f (.listFiles (jio/file TMP_DIR))] (.delete f))))
+    (delete-recursively! (jio/file TMP_DIR))))
 
 (defn- write-wal-file!
   "Write entries to a WAL file. Each entry is [k-bytes v-bytes]; a nil value
@@ -91,7 +97,8 @@
     (let [path (str wal-dir "/0.wal")]
       (write-wal-file! path entries)
       (truncate-file! path (- (.length (jio/file path)) 3)))
-    (let [pairs (wal/load-existing-wal {:wal-dir wal-dir})]
+    (let [[wal-id pairs] (wal/load-existing-wal {:wal-dir wal-dir})]
+      (is (= 0 wal-id) "the WAL id comes from the filename")
       (is (= 2 (count pairs)) "only the two intact entries are replayed")
       (is (data/byte-array-equals? (.getBytes "k1") (ffirst pairs)))
       (is (data/byte-array-equals? (.getBytes "k2") (first (second pairs)))))))
@@ -105,3 +112,29 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (wal/load-existing-wal {:wal-dir wal-dir}))
         "mid-file corruption must raise, not silently truncate the log")))
+
+(deftest load-existing-wal-empty-test
+  (let [wal-dir (str TMP_DIR "/wal-none")]
+    (io/make-dir wal-dir)
+    (is (= [0 []] (wal/load-existing-wal {:wal-dir wal-dir}))
+        "no WAL: id starts at 0 with no entries")))
+
+(deftest load-existing-wal-replays-highest-id-test
+  ;; Multiple WALs is the normal result of crashing after a flush committed the
+  ;; SSTable but before the WAL was deleted. Recovery must replay only the
+  ;; highest-ID WAL (the others are already in SSTables) and discard the rest --
+  ;; NOT treat it as an error, and NOT let stale data shadow newer values.
+  (let [wal-dir (str TMP_DIR "/wal-multi")]
+    (io/make-dir wal-dir)
+    (write-wal-file! (str wal-dir "/1.wal") [[(.getBytes "k") (.getBytes "stale1")]])
+    (write-wal-file! (str wal-dir "/2.wal") [[(.getBytes "k") (.getBytes "stale2")]])
+    ;; sort must be numeric: "10" > "2", so a lexicographic sort would be wrong
+    (write-wal-file! (str wal-dir "/10.wal") [[(.getBytes "k") (.getBytes "fresh")]])
+    (let [[wal-id pairs] (wal/load-existing-wal {:wal-dir wal-dir})]
+      (is (= 10 wal-id) "picks the highest WAL id numerically")
+      (is (= 1 (count pairs)))
+      (is (data/byte-array-equals? (.getBytes "fresh") (:value (second (first pairs))))
+          "replayed data comes from the highest WAL, not a stale one")
+      (is (not (.exists (jio/file (str wal-dir "/1.wal")))) "stale WAL 1 discarded")
+      (is (not (.exists (jio/file (str wal-dir "/2.wal")))) "stale WAL 2 discarded")
+      (is (.exists (jio/file (str wal-dir "/10.wal"))) "highest WAL retained"))))

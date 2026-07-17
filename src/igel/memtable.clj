@@ -85,17 +85,25 @@
               (atom 0)))
 
 (defn init-memtable
-  "Initialize the memtable. Restore data from WAL to the new memtable."
+  "Initialize the memtable, restoring data from the WAL. Returns
+  `[wal-id memtable]`: `wal-id` is the ID of the replayed WAL (0 if none), used
+  to seed the WAL counter.
+
+  The `size` is the *actual* byte size of the replayed entries -- no fabricated
+  value. This makes the zero-check in `flush!` correct (an empty store skips the
+  initial flush; a restored one flushes immediately to commit the WAL) and lines
+  up with the flush threshold check."
   [wal-chan config]
   (let [store (->MemStore (new java.util.TreeMap (data/byte-array-comparator)))
-        wal-pairs (wal/load-existing-wal config)
-        memtable-size (if (empty? wal-pairs) 0 (:memtable-size config))]
+        [wal-id wal-pairs] (wal/load-existing-wal config)]
     ;; `load-existing-wal` returns [k data] entries (data is a value or a
     ;; tombstone). Apply them in WAL order so the replayed memtable matches the
     ;; pre-crash state.
     (doseq [[k data] wal-pairs]
       (store/write-data! store k data))
-    (->Memtable store wal-chan (atom memtable-size))))
+    (let [size (reduce (fn [acc [k data]] (+ acc (wal/entry-size k data)))
+                       0 wal-pairs)]
+      [wal-id (->Memtable store wal-chan (atom size))])))
 
 (defn entry-set
   [^Memtable memtable]

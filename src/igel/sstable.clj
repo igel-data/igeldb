@@ -115,9 +115,12 @@
                      (remove nil?)
                      sort)
         tables (restore-table-info config indexes)
+        ;; The SSTable ID is a plain monotonic counter: the next ID is one past
+        ;; the highest existing one. (The old "+2, odd slots reserved" scheme is
+        ;; abandoned -- compaction inputs are not contiguous in ID space.)
         sstable-id (if (empty? indexes)
                      0
-                     (-> (last indexes) (quot 2) inc (* 2)))]
+                     (inc (last indexes)))]
     (logging/info "Restoring SSTables:" indexes)
     [(->TreeStore sstable-dir
                   (atom (if (empty? tables) [[]] tables))
