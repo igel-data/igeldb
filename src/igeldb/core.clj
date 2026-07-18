@@ -10,11 +10,16 @@
             [igeldb.wal :as wal])
   (:gen-class))
 
+;; The Coordinator is the control plane the foreground (KVS) uses to interact
+;; with the background workers. It deliberately does NOT hold the workers
+;; themselves: the flush writer is a real thread and the WAL worker is a go-loop
+;; parked on reachable channels, so both stay alive on their own.
+;;
 ;; `poison` holds the fatal exception once an IO error trips fail-stop (nil while
 ;; healthy). The WAL worker and flush writer set it; every write/delete checks it.
 ;; `ready` is delivered once the initial flush has established the first WAL
 ;; generation (true on success, false if poisoned during init).
-(defrecord BgWorkers [wal-handler flush-writer flush-req-chan poison ready])
+(defrecord Coordinator [flush-req-chan poison ready])
 
 (defn spawn-bg-workers
   [memtable tree sstable-id wal-id config]
@@ -22,18 +27,12 @@
         flush-wal-chan (async/chan)
         poison (atom nil)
         ready (promise)]
-    (->BgWorkers
-     (f/spawn-flush-writer memtable tree sstable-id wal-id poison ready
-                           flush-req-chan
-                           flush-wal-chan
-                           config)
-     (wal/spawn-wal-writer poison
-                           flush-req-chan
-                           flush-wal-chan
-                           config)
-     flush-req-chan
-     poison
-     ready)))
+    ;; Spawn the workers for their side effects; their return channels are
+    ;; unused (see the Coordinator note above).
+    (f/spawn-flush-writer memtable tree sstable-id wal-id poison ready
+                          flush-req-chan flush-wal-chan config)
+    (wal/spawn-wal-writer poison flush-req-chan flush-wal-chan config)
+    (->Coordinator flush-req-chan poison ready)))
 
 (defn- terminate-flush-writer
   [coordinator]
@@ -100,7 +99,7 @@
           (throw (ex-info (str (name op) " failed repeatedly")
                           {:retriable false} err)))))))
 
-(defrecord KVS [config memtable tree workers]
+(defrecord KVS [config memtable tree coordinator]
   store/IStoreRead
   (select
     [_ k]
@@ -116,18 +115,18 @@
   store/IStoreMutate
   (write!
     [_ k v]
-    (run-mutation! (:poison workers) config :write
+    (run-mutation! (:poison coordinator) config :write
                    #(store/write! @memtable k v)))
   (delete!
     [_ k]
-    (run-mutation! (:poison workers) config :delete
+    (run-mutation! (:poison coordinator) config :delete
                    #(store/delete! @memtable k)))
   (write-data! [_ _ _] (throw (UnsupportedOperationException.)))
 
   Object
   (finalize [_]
     (info "KVS is shutting down...")
-    (terminate-flush-writer workers)))
+    (terminate-flush-writer coordinator)))
 
 ;; ==== Main APIs ====
 
@@ -139,13 +138,13 @@
         [tree sstable-id] (restore-tree-store config)
         [wal-id memtable-val] (init-memtable (async/chan) config)
         memtable (atom memtable-val)
-        workers (spawn-bg-workers memtable tree (atom sstable-id) (atom wal-id)
-                                  config)]
+        coordinator (spawn-bg-workers memtable tree (atom sstable-id)
+                                      (atom wal-id) config)]
     ;; Block until the initial flush has established the first WAL generation
     ;; (and, on restart, committed the replayed WAL to an SSTable).
-    (when-not (true? (deref (:ready workers) INIT_TIMEOUT_MS :timeout))
-      (throw (ex-info "Initializing KVS failed" {} @(:poison workers))))
-    (->KVS config memtable tree workers)))
+    (when-not (true? (deref (:ready coordinator) INIT_TIMEOUT_MS :timeout))
+      (throw (ex-info "Initializing KVS failed" {} @(:poison coordinator))))
+    (->KVS config memtable tree coordinator)))
 
 (defn select
   "Read the value corresponding to the given key.
