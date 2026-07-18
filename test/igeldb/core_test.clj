@@ -1,10 +1,10 @@
-(ns igel.core-test
+(ns igeldb.core-test
   (:require [clojure.test :refer [deftest is]]
             [clojure.java.io :as io]
             [clj-yaml.core :as yaml]
-            [igel.core :as igel]
-            [igel.data :as data]
-            [igel.wal :as wal]))
+            [igeldb.core :as igel]
+            [igeldb.data :as data]
+            [igeldb.wal :as wal]))
 
 ;; If this env var is true, test directories will be left for debugging
 (def ^:private ^:const LEAVE_TEST_DIR "LEAVE_TEST_DIR")

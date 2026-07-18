@@ -1,6 +1,6 @@
-(ns igel.io
+(ns igeldb.io
   (:require [clojure.java.io :as io]
-            [igel.data :as data])
+            [igeldb.data :as data])
   (:import (java.io BufferedInputStream
                     BufferedOutputStream)
            (java.nio ByteBuffer)

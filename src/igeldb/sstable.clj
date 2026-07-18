@@ -1,10 +1,10 @@
-(ns igel.sstable
+(ns igeldb.sstable
   (:require [blossom.core :as blossom]
             [clojure.java.io :as java-io]
             [clojure.tools.logging :as logging]
-            [igel.data :as data]
-            [igel.io :as io]
-            [igel.store :as store])
+            [igeldb.data :as data]
+            [igeldb.io :as io]
+            [igeldb.store :as store])
   (:import (java.io FileOutputStream BufferedOutputStream)
            (java.util.concurrent.locks ReentrantReadWriteLock)))
 

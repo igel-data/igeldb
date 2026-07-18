@@ -1,13 +1,13 @@
-(ns igel.core
+(ns igeldb.core
   (:require [clojure.core.async :as async]
             [clojure.tools.logging :refer [info]]
-            [igel.config :as config]
-            [igel.data :as data]
-            [igel.flush :as f]
-            [igel.memtable :refer [init-memtable]]
-            [igel.sstable :refer [restore-tree-store]]
-            [igel.store :as store]
-            [igel.wal :as wal])
+            [igeldb.config :as config]
+            [igeldb.data :as data]
+            [igeldb.flush :as f]
+            [igeldb.memtable :refer [init-memtable]]
+            [igeldb.sstable :refer [restore-tree-store]]
+            [igeldb.store :as store]
+            [igeldb.wal :as wal])
   (:gen-class))
 
 ;; `poison` holds the fatal exception once an IO error trips fail-stop (nil while

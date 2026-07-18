@@ -1,4 +1,4 @@
-(ns igel.data
+(ns igeldb.data
   (:import (java.util Comparator)))
 
 (defrecord Data [value deleted?])

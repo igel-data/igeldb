@@ -1,6 +1,6 @@
-(ns igel.data-test
+(ns igeldb.data-test
   (:require [clojure.test :refer [deftest is testing]]
-            [igel.data :as data]))
+            [igeldb.data :as data]))
 
 (defn- ->bytes
   [& ints]

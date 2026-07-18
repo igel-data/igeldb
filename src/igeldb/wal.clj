@@ -1,9 +1,9 @@
-(ns igel.wal
+(ns igeldb.wal
   (:require [clojure.core.async :as async]
             [clojure.java.io :as java-io]
             [clojure.tools.logging :as logging]
-            [igel.io :as io]
-            [igel.store :as store])
+            [igeldb.io :as io]
+            [igeldb.store :as store])
   (:import (java.io FileOutputStream BufferedOutputStream)))
 
 (def ^:const ^:private DEFAULT_WINDOW_TIME 200)

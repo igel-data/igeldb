@@ -1,8 +1,8 @@
-(ns igel.config-test
+(ns igeldb.config-test
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is]]
             [clj-yaml.core :as yaml]
-            [igel.config :as config]))
+            [igeldb.config :as config]))
 
 (def ^:private ^:const CONFIG_FILE_PATH "test-data/test-config.yaml")
 

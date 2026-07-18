@@ -1,11 +1,11 @@
-(ns igel.flush
+(ns igeldb.flush
   (:require  [blossom.core :as blossom]
              [clojure.core.async :as async]
              [clojure.tools.logging :as logging]
-             [igel.io :as io]
-             [igel.memtable :as memtable]
-             [igel.sstable :as sstable]
-             [igel.wal :as wal])
+             [igeldb.io :as io]
+             [igeldb.memtable :as memtable]
+             [igeldb.sstable :as sstable]
+             [igeldb.wal :as wal])
   (:import (java.io FileOutputStream BufferedOutputStream)))
 
 (defn- switch-memtable!

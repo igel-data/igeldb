@@ -1,9 +1,9 @@
-(ns igel.io-test
+(ns igeldb.io-test
   (:require [clojure.java.io :as jio]
             [clojure.test :refer [deftest is testing use-fixtures]]
-            [igel.data :as data]
-            [igel.io :as io]
-            [igel.wal :as wal])
+            [igeldb.data :as data]
+            [igeldb.io :as io]
+            [igeldb.wal :as wal])
   (:import (java.io FileOutputStream BufferedOutputStream RandomAccessFile)))
 
 (def ^:private ^:const TMP_DIR "test-data/io-test")

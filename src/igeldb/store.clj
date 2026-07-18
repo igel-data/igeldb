@@ -1,4 +1,4 @@
-(ns igel.store)
+(ns igeldb.store)
 
 (defprotocol IStoreRead
   "Interface for reading from the data store"

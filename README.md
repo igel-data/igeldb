@@ -1,4 +1,4 @@
-# Igel
+# IgelDB
 
 Simple Key-Value Store based on LSM Tree
 
@@ -15,7 +15,7 @@ The written data is persisted into the disk. The memtable (write buffer on memor
 ## Usage
 
 ```clojure
-(require '[igel.core :as igel])
+(require '[igeldb.core :as igel])
 
 ;; Generate a KVS with a config file
 (def kvs (igel/gen-kvs "config.yaml"))

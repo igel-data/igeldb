@@ -1,4 +1,4 @@
-(ns igel.config
+(ns igeldb.config
   (:require [clojure.java.io :refer [reader]]
             [clj-yaml.core :as yaml]))
 
