@@ -118,21 +118,21 @@
   [poison flush-req-chan flush-wal-chan config]
   (io/make-dir (:wal-dir config))
   (let [sync-window (or (:sync-window-time config) DEFAULT_WINDOW_TIME)
-        batch-limit (or (:group-commit-limit config) DEFAULT_GROUP_COMMIT_LIMIT)]
-    ;; wait for the first memtable generation
-    (let [[wal-index memtable] (async/<!! flush-wal-chan)]
-      ;; Start the WAL writer loop
-      (async/go-loop [wal-id wal-index
-                      memtable memtable]
-        (let [data-chan (:wal-chan memtable)
-              memstore (:mem memtable)
-              size (:size memtable)
-              file-stream (FileOutputStream. (wal-file-path wal-id config))
-              out-stream (BufferedOutputStream. file-stream 4096)
+        batch-limit (or (:group-commit-limit config) DEFAULT_GROUP_COMMIT_LIMIT)
+        ;; wait for the first memtable generation
+        [wal-index memtable] (async/<!! flush-wal-chan)]
+    ;; Start the WAL writer loop
+    (async/go-loop [wal-id wal-index
+                    memtable memtable]
+      (let [data-chan (:wal-chan memtable)
+            memstore (:mem memtable)
+            size (:size memtable)
+            file-stream (FileOutputStream. (wal-file-path wal-id config))
+            out-stream (BufferedOutputStream. file-stream 4096)
               ;; `healthy?` is true when this generation ended with a normal
               ;; flush hand-off, false when an IO error poisoned the store.
-              healthy?
-              (try
+            healthy?
+            (try
                 ;; WAL loop until a flush is completed.
                 ;;
                 ;; `batch` is an ordered vector of [k data comp-chan]; the
@@ -148,56 +148,56 @@
                 ;;
                 ;; Group commit triggers on an OR condition: the time window
                 ;; elapsing or the batch reaching `batch-limit` entries.
-                (loop [batch []
-                       window-chan (async/timeout sync-window)]
+              (loop [batch []
+                     window-chan (async/timeout sync-window)]
                   ;; `next` is [next-batch next-window-chan] to keep going, or
                   ;; nil once the data channel is closed (a flush was requested).
-                  (let [next (async/alt!
-                               data-chan ([[k d comp-chan]]
-                                          (when-not (nil? k)
-                                            (io/append-wal! out-stream [k d])
-                                            (let [batch (conj batch [k d comp-chan])]
-                                              (if (>= (count batch) batch-limit)
-                                                (do
-                                                  (commit-batch! out-stream file-stream
-                                                                 batch memstore size)
-                                                  (async/>! flush-req-chan :try-flush)
-                                                  [[] (async/timeout sync-window)])
-                                                [batch window-chan]))))
-                               window-chan ([]
-                                            (if (seq batch)
+                (let [next (async/alt!
+                             data-chan ([[k d comp-chan]]
+                                        (when-not (nil? k)
+                                          (io/append-wal! out-stream [k d])
+                                          (let [batch (conj batch [k d comp-chan])]
+                                            (if (>= (count batch) batch-limit)
                                               (do
                                                 (commit-batch! out-stream file-stream
                                                                batch memstore size)
                                                 (async/>! flush-req-chan :try-flush)
                                                 [[] (async/timeout sync-window)])
-                                              [batch (async/timeout sync-window)])))]
-                    (if (nil? next)
-                      (do
+                                              [batch window-chan]))))
+                             window-chan ([]
+                                          (if (seq batch)
+                                            (do
+                                              (commit-batch! out-stream file-stream
+                                                             batch memstore size)
+                                              (async/>! flush-req-chan :try-flush)
+                                              [[] (async/timeout sync-window)])
+                                            [batch (async/timeout sync-window)])))]
+                  (if (nil? next)
+                    (do
                         ;; Flush requested: commit whatever is still buffered so
                         ;; that every entry of this WAL generation is applied to
                         ;; the memtable BEFORE the switch, then hand off to the
                         ;; flush writer.
-                        (when (seq batch)
-                          (commit-batch! out-stream file-stream batch memstore size))
-                        (.close out-stream)
-                        (.close file-stream)
-                        (async/>! flush-req-chan :flush)
-                        true)
-                      (recur (first next) (second next)))))
-                (catch Throwable e
+                      (when (seq batch)
+                        (commit-batch! out-stream file-stream batch memstore size))
+                      (.close out-stream)
+                      (.close file-stream)
+                      (async/>! flush-req-chan :flush)
+                      true)
+                    (recur (first next) (second next)))))
+              (catch Throwable e
                   ;; Fail-stop: an fsync (or other IO) failure poisons the whole
                   ;; store. Writers already waiting were released with :error by
                   ;; commit-batch!; closing data-chan makes any parked/future
                   ;; `>!!` return false so no writer deadlocks, and `core`
                   ;; rejects every subsequent write.
-                  (reset! poison e)
-                  (logging/error e "WAL writer failed; the store is poisoned")
-                  (async/close! data-chan)
-                  (try (.close out-stream) (catch Throwable _))
-                  (try (.close file-stream) (catch Throwable _))
-                  false))]
-          (when healthy?
+                (reset! poison e)
+                (logging/error e "WAL writer failed; the store is poisoned")
+                (async/close! data-chan)
+                (try (.close out-stream) (catch Throwable _))
+                (try (.close file-stream) (catch Throwable _))
+                false))]
+        (when healthy?
             ;; Wait for the new memtable generation from the flush writer.
-            (let [[wal-id memtable] (async/<! flush-wal-chan)]
-              (recur wal-id memtable))))))))
+          (let [[wal-id memtable] (async/<! flush-wal-chan)]
+            (recur wal-id memtable)))))))

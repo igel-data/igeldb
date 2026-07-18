@@ -14,24 +14,26 @@ jobs:
         java: [ '11', '17' ]
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
 
     - name: Setup Java
-      uses: actions/setup-java@v3
+      uses: actions/setup-java@v5
       with:
         java-version: ${{ matrix.java }}
         distribution: 'temurin'
 
+    - name: Install Clojure CLI
+      uses: DeLaGuardo/setup-clojure@13
+      with:
+        cli: 1.12.5.1654
+
     - name: Cache m2 repository
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: ~/.m2
-        key: ${{ runner.os }}-m2-${{ hashFiles('**/project.clj') }}
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/deps.edn') }}
         restore-keys: |
           ${{ runner.os }}-m2-
 
-    - name: Install dependencies
-      run: lein deps
-
-    - name: Run test
-      run: lein cloverage
+    - name: Run tests
+      run: clojure -X:test

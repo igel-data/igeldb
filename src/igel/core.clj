@@ -79,8 +79,7 @@
   Non-retriable exceptions propagate unchanged. `op` is :write or :delete,
   used only for the message."
   [poison config op mutate!]
-  (loop [retries (:write-retries config)
-         last-err nil]
+  (loop [retries (:write-retries config)]
     (when-let [e @poison]
       (throw (ex-info (str (name op) " rejected: the store is poisoned")
                       {:retriable false} e)))
@@ -97,7 +96,7 @@
       (when err
         (if (pos? retries)
           (do (Thread/sleep 100)
-              (recur (dec retries) err))
+              (recur (dec retries)))
           (throw (ex-info (str (name op) " failed repeatedly")
                           {:retriable false} err)))))))
 

@@ -1,7 +1,7 @@
 (ns igel.memtable
   (:require [clojure.core.async :as async]
             [igel.data :as data]
-            [igel.store :as store :refer [select scan write! delete!]]
+            [igel.store :as store :refer [select scan]]
             [igel.wal :as wal]))
 
 (defrecord MemStore [^java.util.TreeMap mem]
