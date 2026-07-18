@@ -17,6 +17,7 @@
 
 (defn- make-config-file
   [config]
+  (io/make-parents CONFIG_FILE_PATH)
   (with-open [writer (io/writer CONFIG_FILE_PATH)]
     (.write writer (yaml/generate-string config))))
 
