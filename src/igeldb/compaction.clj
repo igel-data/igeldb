@@ -237,8 +237,11 @@
 (defn spawn-compaction-worker
   "Background compaction worker (a real thread, like the flush writer). On each
   `:maybe-compact` signal it compacts until nothing more is needed (a single
-  compaction can push the next level over its limit). Fail-stop on error."
-  [tree sstable-id compact-pointers poison req-chan config]
+  compaction can push the next level over its limit). Fail-stop on error.
+
+  After every compaction it notifies `stall-monitor`: a compaction drains L0, so
+  any writers stalled by back-pressure should re-check and may proceed."
+  [tree sstable-id compact-pointers poison ^Object stall-monitor req-chan config]
   (letfn [(safe-compact! []
             (try
               (compact! tree sstable-id compact-pointers config)
@@ -252,6 +255,7 @@
           (when (nil? @poison)
             (loop []
               (when (true? (safe-compact!))
+                (locking stall-monitor (.notifyAll stall-monitor))
                 (recur))))
           (when (nil? @poison)
             (recur)))))))

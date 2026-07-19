@@ -20,7 +20,10 @@
 ;; healthy). The WAL worker and flush writer set it; every write/delete checks it.
 ;; `ready` is delivered once the initial flush has established the first WAL
 ;; generation (true on success, false if poisoned during init).
-(defrecord Coordinator [flush-req-chan compaction-req-chan poison ready])
+;; `stall-monitor` is the back-pressure condition: writers wait on it while L0
+;; is saturated; the compaction worker and the poison watch notify it.
+(defrecord Coordinator [flush-req-chan compaction-req-chan poison ready
+                        stall-monitor])
 
 (defn spawn-bg-workers
   [memtable tree sstable-id wal-id config]
@@ -30,15 +33,23 @@
         compaction-req-chan (async/chan (async/sliding-buffer 1))
         compact-pointers (atom {})
         poison (atom nil)
-        ready (promise)]
+        ready (promise)
+        stall-monitor (Object.)]
+    ;; Fail-stop must wake stalled writers: when the store is poisoned (by any
+    ;; worker), notify the back-pressure monitor so blocked writers re-check and
+    ;; return the error instead of hanging.
+    (add-watch poison ::wake-stalled-writers
+               (fn [_ _ old new]
+                 (when (and (nil? old) new)
+                   (locking stall-monitor (.notifyAll stall-monitor)))))
     ;; Spawn the workers for their side effects; their return channels are
     ;; unused (see the Coordinator note above).
     (f/spawn-flush-writer memtable tree sstable-id wal-id poison ready
                           flush-req-chan flush-wal-chan compaction-req-chan config)
     (wal/spawn-wal-writer poison flush-req-chan flush-wal-chan config)
     (compaction/spawn-compaction-worker tree sstable-id compact-pointers poison
-                                        compaction-req-chan config)
-    (->Coordinator flush-req-chan compaction-req-chan poison ready)))
+                                        stall-monitor compaction-req-chan config)
+    (->Coordinator flush-req-chan compaction-req-chan poison ready stall-monitor)))
 
 (defn- terminate-workers
   [coordinator]
@@ -72,6 +83,22 @@
                                        m-pairs (rest t-pairs)])]
         (recur updated m-rest t-rest)))))
 
+(defn- await-l0-capacity!
+  "Back-pressure: block before enqueueing a write while L0 holds at least
+  `l0-stall-threshold` tables, until compaction drains it below the threshold or
+  the store is poisoned. The compaction worker notifies `monitor` after each
+  compaction; a watch on `poison` notifies it on fail-stop, so a poisoned store
+  wakes stalled writers rather than deadlocking. The timed wait is a safety net
+  against a missed notification. Returns when unblocked; the caller re-checks
+  `poison` and surfaces the error."
+  [^Object monitor current-version poison threshold]
+  (locking monitor
+    (loop []
+      (when (and (nil? @poison)
+                 (>= (count (first @current-version)) threshold))
+        (.wait monitor 200)
+        (recur)))))
+
 (defn- run-mutation!
   "Run a memtable mutation, applying the two settled error classes:
 
@@ -84,27 +111,35 @@
 
   Non-retriable exceptions propagate unchanged. `op` is :write or :delete,
   used only for the message."
-  [poison config op mutate!]
-  (loop [retries (:write-retries config)]
-    (when-let [e @poison]
-      (throw (ex-info (str (name op) " rejected: the store is poisoned")
-                      {:retriable false} e)))
-    (let [err (try
-                (mutate!)
-                nil
-                (catch clojure.lang.ExceptionInfo e
-                  (cond
-                    @poison
-                    (throw (ex-info (str (name op) " failed: the store is poisoned")
-                                    {:retriable false} @poison))
-                    (-> e ex-data :retriable) e
-                    :else (throw e))))]
-      (when err
-        (if (pos? retries)
-          (do (Thread/sleep 100)
-              (recur (dec retries)))
-          (throw (ex-info (str (name op) " failed repeatedly")
-                          {:retriable false} err)))))))
+  [coordinator tree config op mutate!]
+  (let [poison (:poison coordinator)
+        monitor (:stall-monitor coordinator)
+        threshold (:l0-stall-threshold config)]
+    (loop [retries (:write-retries config)]
+      (when-let [e @poison]
+        (throw (ex-info (str (name op) " rejected: the store is poisoned")
+                        {:retriable false} e)))
+      ;; Stall before enqueueing while L0 is saturated (may be woken by poison).
+      (await-l0-capacity! monitor (:current-version tree) poison threshold)
+      (when-let [e @poison]
+        (throw (ex-info (str (name op) " rejected: the store is poisoned")
+                        {:retriable false} e)))
+      (let [err (try
+                  (mutate!)
+                  nil
+                  (catch clojure.lang.ExceptionInfo e
+                    (cond
+                      @poison
+                      (throw (ex-info (str (name op) " failed: the store is poisoned")
+                                      {:retriable false} @poison))
+                      (-> e ex-data :retriable) e
+                      :else (throw e))))]
+        (when err
+          (if (pos? retries)
+            (do (Thread/sleep 100)
+                (recur (dec retries)))
+            (throw (ex-info (str (name op) " failed repeatedly")
+                            {:retriable false} err))))))))
 
 (defrecord KVS [config memtable tree coordinator]
   store/IStoreRead
@@ -122,11 +157,11 @@
   store/IStoreMutate
   (write!
     [_ k v]
-    (run-mutation! (:poison coordinator) config :write
+    (run-mutation! coordinator tree config :write
                    #(store/write! @memtable k v)))
   (delete!
     [_ k]
-    (run-mutation! (:poison coordinator) config :delete
+    (run-mutation! coordinator tree config :delete
                    #(store/delete! @memtable k)))
   (write-data! [_ _ _] (throw (UnsupportedOperationException.)))
 
