@@ -4,13 +4,31 @@
   # WAL directory
   wal-dir: "./data/wal",
 
-  # The size of memtable in Bytes
-  memtable-size: 1024,
+  # The size of memtable in Bytes (default 16 MiB)
+  memtable-size: 16777216,
 
   # The WAL sync time in milliseconds.
   # It would make disk writes efficient by grouping write requests.
   # Each write would keep waiting for at most this window time.
   sync-window-time: 200,
+
+  # Number of L0 tables that triggers a background L0->L1 compaction
+  l0-compaction-trigger: 4,
+
+  # Number of L0 tables at which writers stall until compaction catches up
+  # (safety valve; must be greater than l0-compaction-trigger)
+  l0-stall-threshold: 16,
+
+  # Each level's total byte capacity is the previous level's times this
+  level-size-multiplier: 10,
+
+  # Total byte capacity of L1. Defaults to memtable-size * l0-compaction-trigger.
+  # l1-base-size: 67108864,
+
+  # Target size in Bytes of a single output SSTable file; compaction splits
+  # its merged output into non-overlapping tables of about this size.
+  # Defaults to memtable-size.
+  # sstable-target-size: 16777216,
 
   # Bloom filter config
   bloom-filter:

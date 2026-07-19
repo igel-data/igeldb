@@ -2,11 +2,14 @@
   (:require [clojure.java.io :refer [reader]]
             [clj-yaml.core :as yaml]))
 
-(def ^:private ^:const DEFAULT_MEMTABLE_SIZE 1024)
+(def ^:private ^:const DEFAULT_MEMTABLE_SIZE (* 16 1024 1024))
 (def ^:private ^:const DEFAULT_SYNC_WINDOW_TIME 200)
 (def ^:private ^:const DEFAULT_GROUP_COMMIT_LIMIT 64)
 (def ^:private ^:const DEFAULT_WRITE_RETRIES 10)
 (def ^:private ^:const DEFAULT_BLOOM_FILTER {:size 10240})
+(def ^:private ^:const DEFAULT_L0_COMPACTION_TRIGGER 4)
+(def ^:private ^:const DEFAULT_L0_STALL_THRESHOLD 16)
+(def ^:private ^:const DEFAULT_LEVEL_SIZE_MULTIPLIER 10)
 
 (defn- read-config
   [config-path]
@@ -21,22 +24,31 @@
                  :sync-window-time DEFAULT_SYNC_WINDOW_TIME
                  :group-commit-limit DEFAULT_GROUP_COMMIT_LIMIT
                  :write-retries DEFAULT_WRITE_RETRIES
-                 :bloom-filter DEFAULT_BLOOM_FILTER}
-        result (merge default config)]
+                 :bloom-filter DEFAULT_BLOOM_FILTER
+                 :l0-compaction-trigger DEFAULT_L0_COMPACTION_TRIGGER
+                 :l0-stall-threshold DEFAULT_L0_STALL_THRESHOLD
+                 :level-size-multiplier DEFAULT_LEVEL_SIZE_MULTIPLIER}
+        merged (merge default config)
+        ;; Derived defaults: computed from the *merged* values so a user's
+        ;; `memtable-size` / `l0-compaction-trigger` overrides flow through,
+        ;; but an explicit `sstable-target-size` / `l1-base-size` still wins
+        ;; (those keys, when present in `merged`, override the derived ones).
+        result (merge {:sstable-target-size (:memtable-size merged)
+                       :l1-base-size (* (:memtable-size merged)
+                                        (:l0-compaction-trigger merged))}
+                      merged)]
     (when (nil? (:sstable-dir result))
       (throw (ex-info "Need to set `sstable-dir` in the config" config)))
     (when (nil? (:wal-dir result))
       (throw (ex-info "Need to set `wal-dir` in the config" config)))
-    (when (not (pos? (:memtable-size result)))
+    (doseq [k [:memtable-size :sync-window-time :group-commit-limit
+               :l0-compaction-trigger :l0-stall-threshold
+               :level-size-multiplier :l1-base-size :sstable-target-size]]
+      (when-not (pos? (k result))
+        (throw (ex-info (str "`" (name k) "` should be positive in the config")
+                        result))))
+    (when-not (> (:l0-stall-threshold result) (:l0-compaction-trigger result))
       (throw (ex-info
-              "`memtable-size` should be positive in the config"
-              config)))
-    (when (not (pos? (:sync-window-time result)))
-      (throw (ex-info
-              "`sync-window-time` should be positive in the config"
-              result)))
-    (when-not (pos? (:group-commit-limit result))
-      (throw (ex-info
-              "`group-commit-limit` should be positive in the config"
+              "`l0-stall-threshold` must be greater than `l0-compaction-trigger`"
               result)))
     result))

@@ -27,8 +27,31 @@
     (is (number? (:memtable-size loaded)))
     (is (number? (:sync-window-time loaded)))
     (is (number? (:write-retries loaded)))
-    (is (seq (:bloom-filter loaded))))
+    (is (seq (:bloom-filter loaded)))
+    ;; Phase 2 level-config defaults
+    (is (number? (:l0-compaction-trigger loaded)))
+    (is (number? (:l0-stall-threshold loaded)))
+    (is (number? (:level-size-multiplier loaded)))
+    ;; derived from memtable-size (* l0-compaction-trigger for l1 base)
+    (is (= (:memtable-size loaded) (:sstable-target-size loaded)))
+    (is (= (* (:memtable-size loaded) (:l0-compaction-trigger loaded))
+           (:l1-base-size loaded))))
 
   (make-config-file invalid-config)
+  (is (thrown? clojure.lang.ExceptionInfo
+               (config/load-config CONFIG_FILE_PATH)))
+
+  ;; explicit overrides win over the derived defaults
+  (make-config-file (assoc valid-config
+                           :sstable-target-size 4096
+                           :l1-base-size 8192))
+  (let [loaded (config/load-config CONFIG_FILE_PATH)]
+    (is (= 4096 (:sstable-target-size loaded)))
+    (is (= 8192 (:l1-base-size loaded))))
+
+  ;; l0-stall-threshold must exceed l0-compaction-trigger
+  (make-config-file (assoc valid-config
+                           :l0-compaction-trigger 8
+                           :l0-stall-threshold 4))
   (is (thrown? clojure.lang.ExceptionInfo
                (config/load-config CONFIG_FILE_PATH))))
