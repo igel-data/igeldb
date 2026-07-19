@@ -11,6 +11,22 @@
   [id dir]
   (str dir "/" id ".sst"))
 
+(defn next-id!
+  "Atomically allocate the next monotonic SSTable id. Safe against concurrent
+  callers (the flush worker and the compaction worker both allocate ids)."
+  [sstable-id]
+  (dec (long (swap! sstable-id inc))))
+
+(defn write-entry!
+  "Write one key/data entry (value or tombstone) to an SSTable output stream and
+  record the key in the bloom filter. Shared by flush and compaction."
+  [out-stream bf ^bytes k data]
+  (io/write-bytes! out-stream k)
+  (if (:deleted? data)
+    (io/write-tombstone! out-stream)
+    (io/write-bytes! out-stream (:value data)))
+  (blossom/add bf k))
+
 ;; SSTable metadata is managed as `[table-id info]`, where `info` is a map
 ;; `{:head-key :tail-key :bloom-filter :size}` (the bloom filter is a live
 ;; object, `:size` is the on-disk byte size). A *version* is an immutable

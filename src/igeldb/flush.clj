@@ -26,18 +26,8 @@
     (logging/info "Starting flush to SSTable" sstable-path)
     (with-open [file-stream (FileOutputStream. sstable-path)
                 out-stream (BufferedOutputStream. file-stream 16384)]
-      (doseq [entry entry-set]
-        (let [k (first entry)
-              data (second entry)
-              value (:value data)]
-          ;; write the key
-          (io/write-bytes! out-stream k)
-          ;; write the value
-          ;; if it's deleted, write only the length 0
-          (if (:deleted? data)
-            (io/write-tombstone! out-stream)
-            (io/write-bytes! out-stream value))
-          (blossom/add bf k)))
+      (doseq [[k data] entry-set]
+        (sstable/write-entry! out-stream bf k data))
       (.flush out-stream)
       (-> file-stream .getFD .sync))
     {:id new-id :level 0 :head-key head-key :tail-key tail-key
@@ -54,7 +44,7 @@
     ;; Nothing to flush: hand the current (unchanged) WAL generation to the
     ;; worker. Only reached for the very first flush of an empty store.
     (async/>!! flush-wal-chan [@wal-id @memtable])
-    (let [new-id @sstable-id
+    (let [new-id (sstable/next-id! sstable-id)
           old-wal-id @wal-id
           new-wal-chan (async/chan)
           entry (-> (switch-memtable! memtable new-wal-chan)
@@ -80,15 +70,15 @@
       ;; manifest, so on restart only the highest-ID WAL is replayed (see
       ;; `wal/load-existing-wal`). Deleting the old WAL before the manifest
       ;; commit would break recovery.
-      (io/delete-file (wal/wal-file-path old-wal-id config))
-      (swap! sstable-id inc))))
+      (io/delete-file (wal/wal-file-path old-wal-id config)))))
 
 (defn spawn-flush-writer
   "Start the flush writer on a dedicated (real) thread: it does blocking file IO
   and blocking channel hand-offs, which belong on a thread rather than a
   core.async go pool. `ready` is delivered once the initial flush has set up the
   first WAL generation (true on success, false if the store was poisoned)."
-  [memtable tree sstable-id wal-id poison ready req-chan flush-wal-chan config]
+  [memtable tree sstable-id wal-id poison ready req-chan flush-wal-chan
+   compaction-req-chan config]
   (letfn [(safe-flush! []
             ;; Fail-stop (3-3): a flush failure poisons the store just like an
             ;; fsync failure. If the loop died silently instead, nothing would
@@ -100,13 +90,20 @@
               (catch Throwable e
                 (reset! poison e)
                 (logging/error e "Flush writer failed; the store is poisoned")
-                false)))]
+                false)))
+          (flush-then-signal! []
+            ;; A successful flush may push L0 past its compaction trigger; nudge
+            ;; the compaction worker (sliding-buffer channel, so this never
+            ;; blocks and signals coalesce).
+            (let [ok (safe-flush!)]
+              (when ok (async/>!! compaction-req-chan :maybe-compact))
+              ok))]
     (async/thread
-      (deliver ready (safe-flush!))
+      (deliver ready (flush-then-signal!))
       (let [threshold (:memtable-size config)]
         (loop []
           (case (async/<!! req-chan)
-            :flush (when (safe-flush!) (recur))
+            :flush (when (flush-then-signal!) (recur))
             :try-flush (do
                          (when (> (deref (:size @memtable)) threshold)
                            ;; close the data channel not to send data to the WAL thread

@@ -1,6 +1,7 @@
 (ns igeldb.core
   (:require [clojure.core.async :as async]
             [clojure.tools.logging :refer [info]]
+            [igeldb.compaction :as compaction]
             [igeldb.config :as config]
             [igeldb.data :as data]
             [igeldb.flush :as f]
@@ -19,24 +20,30 @@
 ;; healthy). The WAL worker and flush writer set it; every write/delete checks it.
 ;; `ready` is delivered once the initial flush has established the first WAL
 ;; generation (true on success, false if poisoned during init).
-(defrecord Coordinator [flush-req-chan poison ready])
+(defrecord Coordinator [flush-req-chan compaction-req-chan poison ready])
 
 (defn spawn-bg-workers
   [memtable tree sstable-id wal-id config]
   (let [flush-req-chan (async/chan)
         flush-wal-chan (async/chan)
+        ;; sliding-buffer so a flush never blocks signaling and signals coalesce
+        compaction-req-chan (async/chan (async/sliding-buffer 1))
+        compact-pointers (atom {})
         poison (atom nil)
         ready (promise)]
     ;; Spawn the workers for their side effects; their return channels are
     ;; unused (see the Coordinator note above).
     (f/spawn-flush-writer memtable tree sstable-id wal-id poison ready
-                          flush-req-chan flush-wal-chan config)
+                          flush-req-chan flush-wal-chan compaction-req-chan config)
     (wal/spawn-wal-writer poison flush-req-chan flush-wal-chan config)
-    (->Coordinator flush-req-chan poison ready)))
+    (compaction/spawn-compaction-worker tree sstable-id compact-pointers poison
+                                        compaction-req-chan config)
+    (->Coordinator flush-req-chan compaction-req-chan poison ready)))
 
-(defn- terminate-flush-writer
+(defn- terminate-workers
   [coordinator]
-  (async/close! (:flush-req-chan coordinator)))
+  (async/close! (:flush-req-chan coordinator))
+  (async/close! (:compaction-req-chan coordinator)))
 
 (defn- merge-scan-results
   [mem-ret tree-ret]
@@ -126,7 +133,7 @@
   Object
   (finalize [_]
     (info "KVS is shutting down...")
-    (terminate-flush-writer coordinator)))
+    (terminate-workers coordinator)))
 
 ;; ==== Main APIs ====
 
