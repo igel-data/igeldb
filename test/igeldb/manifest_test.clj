@@ -174,3 +174,34 @@
       (is (nil? (igel/select kvs (->bytes "no-such-key"))))
       (.finalize kvs))
     (rm-rf data-dir)))
+
+;; ---- Step 2: reads stay consistent across version swaps ------------------
+
+(deftest concurrent-reads-during-version-swaps-test
+  ;; While flushes keep committing new versions (swapping `current-version`),
+  ;; concurrent readers must never throw due to a mid-switch race -- each read
+  ;; sees one immutable snapshot.
+  (let [data-dir "./test-data/version-swap"
+        config-path (make-config-path data-dir)
+        kvs (igel/gen-kvs config-path)
+        stop (atom false)
+        errors (atom [])]
+    (fill! kvs 64)
+    (let [readers (doall
+                   (for [_ (range 4)]
+                     (future
+                       (try
+                         (while (not @stop)
+                           (dotimes [i 64]
+                             (igel/select kvs (->bytes (str "key" i))))
+                           (doall (igel/scan kvs (->bytes "key0") (->bytes "key9"))))
+                         (catch Throwable e (swap! errors conj e))))))]
+      ;; writers keep triggering flushes == version swaps
+      (dotimes [i 384]
+        (igel/write! kvs (->bytes (str "key" i)) (->bytes (str "v" i))))
+      (reset! stop true)
+      (doseq [r readers] @r))
+    (is (empty? @errors)
+        (str "reads threw during version swaps: " (first @errors)))
+    (.finalize kvs)
+    (rm-rf data-dir)))

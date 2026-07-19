@@ -13,9 +13,13 @@
         (if (data/is-valid? data) data (data/deleted-data)))))
   (scan
     [_ from-key to-key]
+    ;; Realize eagerly (mapv): `Memtable/scan` calls this under `(locking mem)`,
+    ;; but the caller consumes the result after the lock is released. A lazy seq
+    ;; over the live TreeMap's entry view would then be iterated while the flush
+    ;; worker mutates the memtable -> ConcurrentModificationException.
     (some->> (.subMap mem from-key true to-key false)
              .entrySet
-             (map
+             (mapv
               (fn [e]
                 (let [k (.getKey e)
                       data (.getValue e)]
