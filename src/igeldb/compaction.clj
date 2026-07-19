@@ -16,12 +16,12 @@
   manifest edit, then atomically swap the version -- is guarded (by the manifest
   lock inside `sstable/commit-edit!`). A compaction failure is fail-stop.
 
+  After committing, the superseded input files are physically deleted under the
+  write lock (`sstable/delete-inputs!`), which waits out any in-flight readers.
+
   TODO (memory): the merge materializes all input entries in a TreeMap. A
   streaming k-way merge over the (already sorted) inputs would bound compaction
-  memory; deferred for now.
-
-  TODO (Step 5): physically delete the superseded input files after the commit,
-  under the write lock. For now they become orphans, ignored on restart."
+  memory; deferred for now."
   (:require [blossom.core :as blossom]
             [clojure.java.io :as java-io]
             [clojure.core.async :as async]
@@ -232,6 +232,9 @@
                                     :deleted (:deleted-ids plan)})
         (when-let [ptr (:pointer plan)]
           (swap! compact-pointers assoc (:level plan) ptr))
+        ;; The version no longer references the inputs; delete their files under
+        ;; the write lock (Step 5), which waits out any in-flight readers.
+        (sstable/delete-inputs! tree (:deleted-ids plan))
         true))))
 
 (defn spawn-compaction-worker

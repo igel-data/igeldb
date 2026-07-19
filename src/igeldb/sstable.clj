@@ -5,7 +5,8 @@
             [igeldb.io :as io]
             [igeldb.manifest :as manifest]
             [igeldb.store :as store])
-  (:import (java.util.concurrent.locks Lock ReentrantReadWriteLock)))
+  (:import (java.io File)
+           (java.util.concurrent.locks Lock ReentrantReadWriteLock)))
 
 (defn get-sstable-path
   [id dir]
@@ -162,6 +163,33 @@
     (locking commit-lock
       (manifest/append-edit! manifest (serialize-edit-blooms edit))
       (swap! (:current-version tree) apply-edit edit))))
+
+;; ---- Deferred-safe physical deletion (Step 5) ----------------------------
+
+(defn delete-inputs!
+  "Physically delete superseded SSTable files, AFTER the committed version has
+  stopped referencing them. Acquires the write lock: once held, every reader has
+  released the read lock, so none is mid-read on these files -- the delete is
+  safe (no `FileNotFoundException`), with no reference counting.
+
+  A file already gone (a delete lost to a prior crash) is tolerated and logged;
+  any other delete failure is a real IO error and propagates (the caller applies
+  fail-stop). A lost delete is non-fatal for correctness: startup ignores
+  SSTables the manifest does not reference."
+  [tree ids]
+  (let [dir (:dir tree)
+        ^Lock write-lock (.writeLock ^ReentrantReadWriteLock (:rw-lock tree))]
+    (.lock write-lock)
+    (try
+      (doseq [id ids]
+        (let [path (get-sstable-path id dir)
+              f (File. ^String path)]
+          (cond
+            (not (.exists f))
+            (logging/warn "Superseded SSTable already gone (lost delete?):" path)
+            (not (.delete f))
+            (throw (ex-info "Failed to delete superseded SSTable" {:path path})))))
+      (finally (.unlock write-lock)))))
 
 ;; ---- Startup recovery ----------------------------------------------------
 

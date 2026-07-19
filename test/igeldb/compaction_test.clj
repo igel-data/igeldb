@@ -131,6 +131,24 @@
   (some #(seq (nth (version-of kvs) % []))
         (range 1 (count (version-of kvs)))))
 
+(defn- version-ids [kvs] (mapv #(mapv first %) (version-of kvs)))
+
+(defn- wait-stable
+  "Wait until the version stops changing (compaction idle), then return it."
+  [kvs]
+  (let [deadline (+ (System/currentTimeMillis) 15000)]
+    (loop [prev ::none]
+      (let [ids (version-ids kvs)]
+        (if (or (= ids prev) (> (System/currentTimeMillis) deadline))
+          ids
+          (do (Thread/sleep 300) (recur ids)))))))
+
+(defn- disk-sstable-ids [sstable-dir]
+  (->> (io/list-files sstable-dir)
+       (filter #(.endsWith (.getName %) ".sst"))
+       (map #(Long/parseLong (re-find #"\d+" (.getName %))))
+       set))
+
 ;; ---- integration: non-overlapping L1+ output -----------------------------
 
 (deftest l0-to-l1-produces-non-overlapping-output-test
@@ -178,5 +196,50 @@
     (wait-until #(l1+-populated? kvs))
     (is (nil? (igel/select kvs (->bytes "gone")))
         "a deleted key stays deleted through compaction (no resurrection)")
+    (.finalize kvs)
+    (rm-rf data-dir)))
+
+;; ---- Step 5: deferred-safe physical deletion -----------------------------
+
+(deftest no-file-not-found-under-concurrent-scan-and-compaction-test
+  ;; Compaction now physically deletes superseded input files. A reader that
+  ;; grabbed a version referencing those files must finish before the delete
+  ;; (the delete waits on the write lock). No read should ever see a missing file.
+  (let [data-dir "./test-data/compaction-concurrent-delete"
+        kvs (igel/gen-kvs (config-path! data-dir))
+        stop (atom false)
+        errors (atom [])]
+    (fill! kvs 0 100)
+    (let [readers (doall
+                   (for [_ (range 4)]
+                     (future
+                       (try
+                         (while (not @stop)
+                           (doall (igel/scan kvs (->bytes "k00000") (->bytes "k99999")))
+                           (dotimes [i 100]
+                             (igel/select kvs (->bytes (format "k%05d" i)))))
+                         (catch Throwable e (swap! errors conj e))))))]
+      (fill! kvs 100 800) ;; heavy compaction (+ deletion) churn
+      (reset! stop true)
+      (doseq [r readers] @r))
+    (is (empty? @errors)
+        (str "reads threw during concurrent compaction+deletion: "
+             (first @errors)))
+    (.finalize kvs)
+    (rm-rf data-dir)))
+
+(deftest superseded-input-files-are-deleted-test
+  ;; Once compaction settles, no orphan SSTable files remain: the .sst files on
+  ;; disk are exactly those the current version references.
+  (let [data-dir "./test-data/compaction-cleanup"
+        kvs (igel/gen-kvs (config-path! data-dir))
+        sstable-dir (str data-dir "/sstable")]
+    (fill! kvs 0 600)
+    (wait-stable kvs)
+    (let [referenced (set (mapcat identity (version-ids kvs)))
+          on-disk (disk-sstable-ids sstable-dir)]
+      (is (= referenced on-disk)
+          (str "superseded files not cleaned / referenced file missing"
+               " -- version=" referenced " disk=" on-disk)))
     (.finalize kvs)
     (rm-rf data-dir)))
