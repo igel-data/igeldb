@@ -6,7 +6,7 @@
              [igeldb.memtable :as memtable]
              [igeldb.sstable :as sstable]
              [igeldb.wal :as wal])
-  (:import (java.io FileOutputStream BufferedOutputStream)))
+  (:import (java.io FileOutputStream BufferedOutputStream File)))
 
 (defn- switch-memtable!
   [memtable wal-chan]
@@ -14,33 +14,34 @@
     old))
 
 (defn- flush-memtable!
+  "Write the memtable out as one L0 SSTable (data + fsync) and return the table
+  entry `{:id :level 0 :head-key :tail-key :bloom-filter :size}`. No `.info` file
+  -- the manifest is now the sole metadata source (see `sstable/commit-edit!`)."
   [memtable new-id {:keys [sstable-dir bloom-filter]}]
   (let [sstable-path (sstable/get-sstable-path new-id sstable-dir)
-        info-path (sstable/get-info-path new-id sstable-dir)
         bf (blossom/make-filter bloom-filter)
         entry-set (memtable/entry-set memtable)
         head-key (-> entry-set first first)
         tail-key (-> entry-set last first)]
     (logging/info "Starting flush to SSTable" sstable-path)
-    (with-open [file-stream (FileOutputStream. sstable-path)]
-      (with-open [out-stream (BufferedOutputStream. file-stream 16384)]
-        (doseq [entry entry-set]
-          (let [k (first entry)
-                data (second entry)
-                value (:value data)]
-            ;; write the key
-            (io/write-bytes! out-stream k)
-            ;; write the value
-            ;; if it's deleted, write only the length 0
-            (if (:deleted? data)
-              (io/write-tombstone! out-stream)
-              (io/write-bytes! out-stream value))
-            (blossom/add bf k)))
-        (.flush out-stream)
-        (-> file-stream .getFD .sync)))
-    (let [table-info (sstable/->TableInfo bf head-key tail-key)]
-      (sstable/write-table-info info-path table-info 0)
-      table-info)))
+    (with-open [file-stream (FileOutputStream. sstable-path)
+                out-stream (BufferedOutputStream. file-stream 16384)]
+      (doseq [entry entry-set]
+        (let [k (first entry)
+              data (second entry)
+              value (:value data)]
+          ;; write the key
+          (io/write-bytes! out-stream k)
+          ;; write the value
+          ;; if it's deleted, write only the length 0
+          (if (:deleted? data)
+            (io/write-tombstone! out-stream)
+            (io/write-bytes! out-stream value))
+          (blossom/add bf k)))
+      (.flush out-stream)
+      (-> file-stream .getFD .sync))
+    {:id new-id :level 0 :head-key head-key :tail-key tail-key
+     :bloom-filter bf :size (.length (File. sstable-path))}))
 
 (defn- flush!
   "Commit the current memtable to an SSTable (when it holds data) and rotate the
@@ -56,19 +57,29 @@
     (let [new-id @sstable-id
           old-wal-id @wal-id
           new-wal-chan (async/chan)
-          table-info (-> (switch-memtable! memtable new-wal-chan)
-                         (flush-memtable! new-id config))]
+          entry (-> (switch-memtable! memtable new-wal-chan)
+                    (flush-memtable! new-id config))]
+      ;; Ordering is crash-safety-critical:
+      ;;   write+fsync SSTable (done above)
+      ;;   -> append+fsync the manifest edit  <- COMMIT POINT
+      ;;   -> hand the new WAL generation to the worker
+      ;;   -> delete the old WAL
+      ;; The manifest commit MUST precede the WAL hand-off. Otherwise a crash
+      ;; after the SSTable write but before the commit would leave the new
+      ;; (higher-id) WAL as the newest; recovery replays only the newest and
+      ;; discards the old WAL, whose data lives only in the un-committed (orphan,
+      ;; therefore ignored) SSTable -> data loss.
+      (sstable/commit-edit! tree {:added [entry] :deleted []})
       ;; Hand the new WAL generation to the worker. `switch-memtable!` has
       ;; already installed the new (empty) memtable as `@memtable`; the worker
       ;; reads its wal-chan, memstore and size from it. The new WAL ID is the
       ;; WAL counter's next value, independent of the SSTable ID.
       (async/>!! flush-wal-chan [(swap! wal-id inc) @memtable])
-      (sstable/add-new-table! tree new-id table-info)
-      ;; Crash-recovery invariant: the SSTable is committed BEFORE the old WAL is
-      ;; deleted, so every WAL except the newest is already in an SSTable. On
-      ;; restart only the highest-ID WAL is replayed (see `wal/load-existing-wal`).
-      ;; A future change that deletes the WAL before committing the SSTable would
-      ;; break recovery.
+      ;; Crash-recovery invariant: "SSTable committed" now means "manifest edit
+      ;; fsynced". Every WAL except the newest is already committed to the
+      ;; manifest, so on restart only the highest-ID WAL is replayed (see
+      ;; `wal/load-existing-wal`). Deleting the old WAL before the manifest
+      ;; commit would break recovery.
       (io/delete-file (wal/wal-file-path old-wal-id config))
       (swap! sstable-id inc))))
 

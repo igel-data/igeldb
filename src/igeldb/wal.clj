@@ -50,10 +50,11 @@
   "Return `[wal-id entries]` for crash recovery.
 
   Crash-recovery invariant: every WAL other than the highest-ID one has already
-  been committed to an SSTable (flush commits the SSTable before deleting the
-  WAL). So multiple WALs remaining is the *normal* result of crashing after a
-  flush's SSTable commit but before the WAL delete -- it must not be treated as
-  an error. We replay only the highest-ID WAL and discard the stale ones.
+  been committed to the manifest (a flush appends+fsyncs its manifest edit --
+  the commit point -- before deleting the WAL). So multiple WALs remaining is
+  the *normal* result of crashing after a flush's manifest commit but before the
+  WAL delete -- it must not be treated as an error. We replay only the
+  highest-ID WAL and discard the stale ones.
 
   When no WAL exists, the WAL ID starts at 0 with no entries."
   [config]
