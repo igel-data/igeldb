@@ -24,27 +24,30 @@
   (Long/parseLong (re-find #"\d+" (.getName file))))
 
 (defn- replay-wal
-  "Replay one WAL file into a vector of [k data] entries."
+  "Replay one WAL file into a flat vector of [ikey data] entries. Each WAL record
+  is one tx (format v2); its entries are appended in order. A tx is all-or-nothing:
+  a torn tail record is discarded whole (its entries never appear)."
   [wal-file]
   (with-open [in-stream (java-io/input-stream wal-file)]
     (loop [result (transient [])]
-      (let [entry (io/read-kv-pair! in-stream)]
-        (case entry
+      (let [record (io/read-wal-record! in-stream)]
+        (case record
           ;; clean end of the log
           :eof (persistent! result)
-          ;; An incomplete entry at the tail is expected: the process died
-          ;; before this write's fsync completed. Keep everything before it.
+          ;; An incomplete record at the tail is expected: the process died before
+          ;; this tx's fsync completed. The whole tx is uncommitted -> discard it,
+          ;; keeping every fully-committed tx before it.
           :truncated
           (do
-            (logging/warn "Discarding an incomplete tail entry in WAL"
+            (logging/warn "Discarding an incomplete tail tx record in WAL"
                           (.getName wal-file))
             (persistent! result))
           ;; A CRC mismatch mid-file is real corruption, not a torn tail.
           :corrupt
           (throw (ex-info "WAL is corrupted (CRC mismatch)"
                           {:file (.getName wal-file)}))
-          ;; entry is [k data]
-          (recur (conj! result entry)))))))
+          ;; record is [seq entries]; append the tx's [ikey data] entries in order
+          (recur (reduce conj! result (second record))))))))
 
 (defn load-existing-wal
   "Return `[wal-id entries]` for crash recovery.
@@ -97,7 +100,9 @@
   The batch is applied as one atomic snapshot publish (`write-batch!`), so a
   lock-free reader sees the pre-batch or post-batch memtable, never a torn
   mid-batch view. This worker is the sole applier, preserving WAL-append order ==
-  memtable-apply order."
+  memtable-apply order. Each batch element is one tx record `[seq entries
+  comp-chan]`; a record's entries are never split across batches, so a tx applies
+  all-or-nothing even within a multi-tx batch."
   [^BufferedOutputStream out-stream ^FileOutputStream file-stream batch memstore size]
   (try
     (.flush out-stream)
@@ -111,8 +116,10 @@
       (doseq [[_ _ comp-chan] batch]
         (async/>!! comp-chan :error))
       (throw e)))
-  (store/write-batch! memstore (mapv (fn [[ikey data _]] [ikey data]) batch))
-  (swap! size + (transduce (map (fn [[ikey data _]] (entry-size ikey data))) + 0 batch))
+  ;; flatten every batched tx's entries (in record order) into one atomic publish
+  (let [entries (into [] (mapcat (fn [[_ es _]] es)) batch)]
+    (store/write-batch! memstore entries)
+    (swap! size + (transduce (map (fn [[ikey data]] (entry-size ikey data))) + 0 entries)))
   (doseq [[_ _ comp-chan] batch]
     (async/>!! comp-chan :done)))
 
@@ -137,9 +144,9 @@
             (try
                 ;; WAL loop until a flush is completed.
                 ;;
-                ;; `batch` is an ordered vector of [k data comp-chan]; the
-                ;; ordering is the source of truth for concurrent writes to the
-                ;; same key.
+                ;; `batch` is an ordered vector of tx records [seq entries
+                ;; comp-chan]; the ordering (== enqueue order == seq order, held by
+                ;; the commit lock) is the source of truth for concurrent commits.
                 ;;
                 ;; `window-chan` is an `async/timeout` channel and must be
                 ;; recreated every time it fires: a timed-out channel stays
@@ -155,10 +162,11 @@
                   ;; `next` is [next-batch next-window-chan] to keep going, or
                   ;; nil once the data channel is closed (a flush was requested).
                 (let [next (async/alt!
-                             data-chan ([[ikey d comp-chan]]
-                                        (when-not (nil? ikey)
-                                          (io/append-entry! out-stream [ikey d])
-                                          (let [batch (conj batch [ikey d comp-chan])]
+                             data-chan ([record]
+                                        (when-not (nil? record)
+                                          (let [[s entries _] record]
+                                            (io/write-wal-record! out-stream s entries))
+                                          (let [batch (conj batch record)]
                                             (if (>= (count batch) batch-limit)
                                               (do
                                                 (commit-batch! out-stream file-stream

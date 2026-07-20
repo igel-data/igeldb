@@ -2,7 +2,8 @@
   (:require [clojure.java.io :as io]
             [igeldb.data :as data])
   (:import (java.io BufferedInputStream
-                    BufferedOutputStream)
+                    BufferedOutputStream
+                    ByteArrayOutputStream)
            (java.nio ByteBuffer)
            (java.util.zip CRC32)))
 
@@ -220,3 +221,98 @@
               (and emitted (data/byte-array-equals? uk emitted)) (recur pairs emitted)
               (> (:seq ikey) snapshot-seq) (recur pairs emitted)
               :else (recur (conj! pairs [uk data]) uk))))))))
+
+(defn read-latest-seq
+  "The seq of the *newest* version of `target-key` (a user_key) in an SSTable, or
+  nil if the key is absent. Entries are user_key-asc / seq-desc, so the first entry
+  with user_key == target is the newest version -- its seq. Used by commit-time
+  write-write conflict detection (the blind-write lookup)."
+  [file-path target-key]
+  (with-open [in-stream (io/input-stream file-path)]
+    (read-format-byte! in-stream file-path)
+    (loop []
+      (let [entry (read-kv-pair! in-stream)]
+        (case entry
+          :eof nil
+          (:truncated :corrupt)
+          (throw (ex-info "SSTable is corrupted"
+                          {:file (str file-path) :reason entry}))
+          (let [[ikey _] entry
+                cmp (.compare (data/byte-array-comparator) (:user-key ikey) target-key)]
+            (cond
+              (neg? cmp) (recur)          ;; before the target user_key
+              (pos? cmp) nil              ;; past it -> not present
+              :else (:seq ikey))))))))    ;; first match = newest version (seq-desc)
+
+;; ---- WAL record encoding (format v2) -------------------------------------
+;;
+;; One transaction = one WAL record (Point 6), wrapped in the same length+bytes+CRC
+;; frame `write-bytes!`/`read-data!` already use, so atomicity == frame
+;; completeness: a torn tail is `:truncated` (an uncommitted tx, discarded) and a
+;; mid-frame flip is `:corrupt` (raises). The framed payload is:
+;;   format-byte(1) ++ seq(8) ++ entry-count(8)
+;;   ++ for each entry: keylen(8) ++ user_key ++ vallen(8) ++ value
+;; A value length of 0 is a tombstone (same convention as the segment encoding).
+;; Every entry of a tx shares the record's single seq, so no per-entry seq.
+
+(def ^:const WAL_FORMAT_VERSION 2)
+
+(defn encode-wal-record
+  "Serialize one tx (its `seq` and folded `[ikey data]` entries) into the record
+  payload bytes. The caller frames it with `write-bytes!` (length + CRC)."
+  ^bytes [seq entries]
+  (let [baos (ByteArrayOutputStream.)]
+    (.write baos (int WAL_FORMAT_VERSION))
+    (.write baos (serialize-long seq))
+    (.write baos (serialize-long (count entries)))
+    (doseq [[ikey data] entries]
+      (let [uk ^bytes (:user-key ikey)]
+        (.write baos (serialize-long (count uk)))
+        (.write baos uk)
+        (if (:deleted? data)
+          (.write baos (serialize-long 0))
+          (let [v ^bytes (:value data)]
+            (.write baos (serialize-long (count v)))
+            (.write baos v)))))
+    (.toByteArray baos)))
+
+(defn write-wal-record!
+  "Append one framed WAL record (one tx) to a WAL output stream."
+  [^BufferedOutputStream out-stream seq entries]
+  (write-bytes! out-stream (encode-wal-record seq entries)))
+
+(defn decode-wal-record
+  "Parse a WAL record payload into `[seq entries]`, where each entry is
+  `[ikey data]` with `ikey`'s seq set to the record's seq."
+  [^bytes payload]
+  (let [buf (ByteBuffer/wrap payload)
+        fmt (.get buf)]
+    (when-not (= (int fmt) WAL_FORMAT_VERSION)
+      (throw (ex-info "Unsupported or corrupt WAL record format" {:format-byte fmt})))
+    (let [seq (.getLong buf)
+          n (.getLong buf)]
+      (loop [i 0 acc (transient [])]
+        (if (= i n)
+          [seq (persistent! acc)]
+          (let [klen (.getLong buf)
+                k (make-array Byte/TYPE klen)
+                _ (.get buf ^bytes k)
+                vlen (.getLong buf)
+                data (if (zero? vlen)
+                       (data/deleted-data)
+                       (let [v (make-array Byte/TYPE vlen)]
+                         (.get buf ^bytes v)
+                         (data/new-data v)))]
+            (recur (inc i) (conj! acc [(data/->ikey k seq) data]))))))))
+
+(defn read-wal-record!
+  "Read one framed WAL record. Returns `:eof` / `:truncated` / `:corrupt` (as
+  `read-data!` classifies the frame) or `[seq entries]` for a complete tx."
+  [^BufferedInputStream in-stream]
+  (let [r (read-data! in-stream)]
+    (cond
+      (map? r) (decode-wal-record (:ok r))
+      ;; a 0-length frame (:tombstone) is impossible for a real record (the
+      ;; payload always has the header) -> treat as corruption
+      (= r :tombstone) :corrupt
+      :else r)))

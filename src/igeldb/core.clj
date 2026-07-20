@@ -162,7 +162,69 @@
   (when (= :closed @(:poison coordinator))
     (throw (ex-info (str (name op) " rejected: the store is closed") {}))))
 
-(defrecord KVS [config memtable immutable-memtable tree registry coordinator]
+;; ---- Commit-handler (Step 4) ---------------------------------------------
+
+(defn- conflict?
+  "Write-write conflict (first-committer-wins): true if ANY write-set key has a
+  committed version newer than the tx's snapshot (its latest committed seq >
+  snapshot seq). Blind writes are included -- every key is looked up via the read
+  path (`store/latest-seq` on the KVS, bloom-filtered; 0 if never written). Runs
+  inside the commit lock."
+  [kvs snapshot-seq entries]
+  (some (fn [[k _]] (> (or (store/latest-seq kvs k) 0) snapshot-seq)) entries))
+
+(defn commit!
+  "The commit-handler: serialize commits under the store's commit lock, holding it
+  over {conflict-check -> seq assign -> enqueue one WAL record}. fsync + memtable
+  apply stay in the group-commit worker (durability stays there). Assigning the seq
+  and enqueuing in the same locked region makes enqueue order == seq order, so the
+  worker's FIFO gives WAL order == seq order (the seq analogue of Phase 1's
+  WAL-order == apply-order invariant).
+
+  `entries` are folded [user_key data] pairs (one per user_key). `snapshot-seq` is
+  the tx's pinned snapshot, or nil for a non-tx auto-commit op -- which skips the
+  conflict-check phase (it writes at latest; last-write-wins is always correct, so
+  there is no snapshot->commit gap for a conflict to occur in). Returns:
+    :committed  durably fsynced and applied
+    :conflict   (tx only) a write-set key was committed after the snapshot
+    :switched   the memtable switched mid-enqueue; the caller may retry
+  Throws {:retriable false} if the worker failed the commit (e.g. an fsync fault;
+  the store is then poisoned and the caller's wrapper surfaces the real cause)."
+  [kvs snapshot-seq entries]
+  (let [registry (:registry kvs)
+        commit-lock (:commit-lock kvs)
+        memtable (:memtable kvs)
+        comp-chan (async/chan)
+        outcome (locking commit-lock
+                  (if (and snapshot-seq (conflict? kvs snapshot-seq entries))
+                    :conflict
+                    (let [s (tx/next-seq! registry)
+                          record (mapv (fn [[k data]] [(data/->ikey k s) data]) entries)]
+                      (if (async/>!! (:wal-chan @memtable) [s record comp-chan])
+                        :enqueued
+                        :switched))))]
+    (case outcome
+      :conflict :conflict
+      :switched :switched
+      :enqueued (case (async/<!! comp-chan)
+                  :done :committed
+                  ;; :error (fsync fault) or a closed channel: the store is being
+                  ;; poisoned; surface a non-retriable failure so run-mutation!
+                  ;; re-checks poison and reports the real cause.
+                  (throw (ex-info "Commit failed" {:retriable false}))))))
+
+(defn- auto-commit!
+  "Non-tx auto-commit of a folded write-set (no snapshot -> no conflict check).
+  Adapts `commit!` to `run-mutation!`'s contract: nil on success, a retriable
+  ex-info on a memtable switch."
+  [kvs entries]
+  (case (commit! kvs nil entries)
+    :committed nil
+    :switched (throw (ex-info "Write failed due to memtable switching"
+                              {:retriable true}))))
+
+(defrecord KVS [config memtable immutable-memtable tree registry commit-lock
+                coordinator]
   store/IStoreRead
   (select
     [_ k snapshot-seq]
@@ -191,16 +253,25 @@
       (->> (merge-scan-results (merge-scan-results mem-ret imm-ret) tree-ret)
            (filter (fn [[_ data]] (data/is-valid? data)))
            (map (fn [[k data]] [k (:value data)])))))
+  (latest-seq
+    [_ k]
+    ;; the newest committed seq for k across mutable memtable -> immutable memtable
+    ;; -> tree. Higher-precedence sources hold newer versions (post-flush writes get
+    ;; higher seqs than the flushed data), so the first source that contains k gives
+    ;; its latest seq. nil if k was never written. Drives conflict detection.
+    (or (store/latest-seq @memtable k)
+        (when-let [imm @immutable-memtable] (store/latest-seq imm k))
+        (store/latest-seq tree k)))
 
   store/IStoreMutate
   (write!
-    [_ k v]
+    [this k v]
     (run-mutation! coordinator tree config :write
-                   #(store/write! @memtable k v)))
+                   #(auto-commit! this [[k (data/new-data v)]])))
   (delete!
-    [_ k]
+    [this k]
     (run-mutation! coordinator tree config :delete
-                   #(store/delete! @memtable k)))
+                   #(auto-commit! this [[k (data/deleted-data)]])))
   (write-data! [_ _ _] (throw (UnsupportedOperationException.)))
   (write-batch! [_ _] (throw (UnsupportedOperationException.))))
 
@@ -238,13 +309,17 @@
         ;; progress). Reads consult it between the mutable memtable and the
         ;; version, closing the flush-visibility gap (see KVS/select).
         immutable-memtable (atom nil)
+        ;; serializes the commit-handler's {conflict-check -> seq assign ->
+        ;; enqueue} critical section (see `commit!`)
+        commit-lock (Object.)
         coordinator (spawn-bg-workers memtable immutable-memtable tree
                                       (atom sstable-id) (atom wal-id) config)]
     ;; Block until the initial flush has established the first WAL generation
     ;; (and, on restart, committed the replayed WAL to an SSTable).
     (when-not (true? (deref (:ready coordinator) INIT_TIMEOUT_MS :timeout))
       (throw (ex-info "Initializing KVS failed" {} @(:poison coordinator))))
-    (->KVS config memtable immutable-memtable tree registry coordinator)))
+    (->KVS config memtable immutable-memtable tree registry commit-lock
+           coordinator)))
 
 (defn select
   "Read the value corresponding to the given key.

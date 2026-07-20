@@ -1,6 +1,5 @@
 (ns igeldb.memtable
-  (:require [clojure.core.async :as async]
-            [igeldb.data :as data]
+  (:require [igeldb.data :as data]
             [igeldb.store :as store]
             [igeldb.tx :as tx]
             [igeldb.wal :as wal]))
@@ -50,6 +49,10 @@
             (and emitted (data/byte-array-equals? uk emitted)) (recur (rest es) acc emitted)
             (> (:seq ikey) snapshot-seq) (recur (rest es) acc emitted)
             :else (recur (rest es) (conj! acc [uk data]) uk))))))
+  (latest-seq
+    [_ k]
+    ;; newest version = the entry with the largest seq for k (snapshot = latest)
+    (:seq (first (newest-visible @store k Long/MAX_VALUE))))
 
   store/IStoreMutate
   ;; The worker applies whole batches via write-batch!; the single-op mutators are
@@ -71,40 +74,19 @@
   (scan
     [_ from-key to-key snapshot-seq]
     (store/scan mem from-key to-key snapshot-seq))
+  (latest-seq
+    [_ k]
+    (store/latest-seq mem k))
 
   store/IStoreMutate
-  ;; Writers assign a seq, then enqueue an InternalKey entry to the WAL channel and
-  ;; wait for the group-commit worker. The worker (a single thread) appends to the
-  ;; WAL, fsyncs, then applies the batch to the memtable -- keeping WAL-append
-  ;; order == memtable-apply order == seq order, and making rollback on fsync
-  ;; failure unnecessary. (Step 1: seq is a global counter per write; Step 4 moves
-  ;; seq assignment into the commit-handler.)
-  (write!
-    [_ k v]
-    (let [ikey (data/->ikey k (tx/next-seq! registry))
-          comp-chan (async/chan)]
-      (when-not (async/>!! wal-chan [ikey (data/new-data v) comp-chan])
-        (throw (ex-info "Write failed due to memtable switching"
-                        {:retriable true})))
-      (case (async/<!! comp-chan)
-        :done nil
-        nil (throw (ex-info "Write failed due to memtable switching"
-                            {:retriable true}))
-        (throw (ex-info "Write failed" {:retriable false})))))
+  ;; The commit-handler (see `igeldb.core/commit!`) owns the write path now: it
+  ;; assigns the tx seq and enqueues one WAL record to `wal-chan` under the commit
+  ;; lock; the group-commit worker fsyncs and applies each record's entries to
+  ;; `mem` via `write-batch!`. The Memtable therefore has no single-op mutators.
+  (write! [_ _ _] (throw (UnsupportedOperationException.)))
   (write-data! [_ _ _] (throw (UnsupportedOperationException.)))
   (write-batch! [_ _] (throw (UnsupportedOperationException.)))
-  (delete!
-    [_ k]
-    (let [ikey (data/->ikey k (tx/next-seq! registry))
-          comp-chan (async/chan)]
-      (when-not (async/>!! wal-chan [ikey (data/deleted-data) comp-chan])
-        (throw (ex-info "Delete failed due to memtable switching"
-                        {:retriable true})))
-      (case (async/<!! comp-chan)
-        :done nil
-        nil (throw (ex-info "Delete failed due to memtable switching"
-                            {:retriable true}))
-        (throw (ex-info "Delete failed" {:retriable false}))))))
+  (delete! [_ _] (throw (UnsupportedOperationException.))))
 
 (defn- empty-store []
   (->MemStore (atom (sorted-map-by (data/internal-key-comparator)))))

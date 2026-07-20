@@ -8,7 +8,10 @@
   ;; and nil.
   ;; The deleted data is a tombstone, and nil means that the key doesn't exist.
   (select [this ^bytes k snapshot-seq])
-  (scan [this ^bytes from-key ^bytes to-key snapshot-seq]))
+  (scan [this ^bytes from-key ^bytes to-key snapshot-seq])
+  ;; The seq of the newest committed version of `k` (latest, ignoring snapshots),
+  ;; or nil if absent. Used for commit-time write-write conflict detection.
+  (latest-seq [this ^bytes k]))
 
 (defprotocol IStoreMutate
   "Interface for mutations to the data store"

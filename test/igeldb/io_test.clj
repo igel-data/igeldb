@@ -21,14 +21,30 @@
     (delete-recursively! (jio/file TMP_DIR))))
 
 (defn- write-wal-file!
-  "Write entries to a WAL file. Each entry is [k-bytes v-bytes]; a nil value
-  writes a tombstone. Seqs are assigned 1, 2, 3, ..."
+  "Write entries as raw SSTable-style segments (key seg + value seg). Each entry
+  is [k-bytes v-bytes]; a nil value writes a tombstone. Seqs are assigned 1, 2,
+  3, ... Exercises the segment reader `read-kv-pair!` (shared by SSTables)."
   [path entries]
   (with-open [fs (FileOutputStream. path)
               os (BufferedOutputStream. fs)]
     (doseq [[i [k v]] (map-indexed vector entries)]
       (io/append-entry! os [(data/->ikey k (inc i))
                             (if v (data/new-data v) (data/deleted-data))]))
+    (.flush os)
+    (-> fs .getChannel (.force true))))
+
+(defn- write-wal-records!
+  "Write entries to a WAL file as format-v2 records, one tx (record) per entry.
+  Each entry is [k-bytes v-bytes]; a nil value writes a tombstone. Seqs are
+  assigned 1, 2, 3, ... This is the real WAL on-disk format that
+  `wal/load-existing-wal` replays."
+  [path entries]
+  (with-open [fs (FileOutputStream. path)
+              os (BufferedOutputStream. fs)]
+    (doseq [[i [k v]] (map-indexed vector entries)]
+      (io/write-wal-record! os (inc i)
+                            [[(data/->ikey k (inc i))
+                              (if v (data/new-data v) (data/deleted-data))]]))
     (.flush os)
     (-> fs .getChannel (.force true))))
 
@@ -97,11 +113,11 @@
   (let [wal-dir (str TMP_DIR "/wal-trunc")]
     (io/make-dir wal-dir)
     (let [path (str wal-dir "/0.wal")]
-      (write-wal-file! path entries)
+      (write-wal-records! path entries)
       (truncate-file! path (- (.length (jio/file path)) 3)))
     (let [[wal-id pairs] (wal/load-existing-wal {:wal-dir wal-dir})]
       (is (= 0 wal-id) "the WAL id comes from the filename")
-      (is (= 2 (count pairs)) "only the two intact entries are replayed")
+      (is (= 2 (count pairs)) "only the two intact tx records are replayed")
       (is (data/byte-array-equals? (.getBytes "k1") (:user-key (ffirst pairs))))
       (is (data/byte-array-equals? (.getBytes "k2") (:user-key (first (second pairs))))))))
 
@@ -109,8 +125,10 @@
   (let [wal-dir (str TMP_DIR "/wal-corrupt")]
     (io/make-dir wal-dir)
     (let [path (str wal-dir "/0.wal")]
-      (write-wal-file! path entries)
-      (flip-byte! path 34)) ;; corrupt entry 1's value data (see layout above)
+      (write-wal-records! path entries)
+      ;; record 0's frame = len(8) ++ payload(37) ++ crc(8); offset 20 is inside
+      ;; the payload, so its CRC no longer matches -> mid-file corruption.
+      (flip-byte! path 20))
     (is (thrown? clojure.lang.ExceptionInfo
                  (wal/load-existing-wal {:wal-dir wal-dir}))
         "mid-file corruption must raise, not silently truncate the log")))
@@ -128,10 +146,10 @@
   ;; NOT treat it as an error, and NOT let stale data shadow newer values.
   (let [wal-dir (str TMP_DIR "/wal-multi")]
     (io/make-dir wal-dir)
-    (write-wal-file! (str wal-dir "/1.wal") [[(.getBytes "k") (.getBytes "stale1")]])
-    (write-wal-file! (str wal-dir "/2.wal") [[(.getBytes "k") (.getBytes "stale2")]])
+    (write-wal-records! (str wal-dir "/1.wal") [[(.getBytes "k") (.getBytes "stale1")]])
+    (write-wal-records! (str wal-dir "/2.wal") [[(.getBytes "k") (.getBytes "stale2")]])
     ;; sort must be numeric: "10" > "2", so a lexicographic sort would be wrong
-    (write-wal-file! (str wal-dir "/10.wal") [[(.getBytes "k") (.getBytes "fresh")]])
+    (write-wal-records! (str wal-dir "/10.wal") [[(.getBytes "k") (.getBytes "fresh")]])
     (let [[wal-id pairs] (wal/load-existing-wal {:wal-dir wal-dir})]
       (is (= 10 wal-id) "picks the highest WAL id numerically")
       (is (= 1 (count pairs)))

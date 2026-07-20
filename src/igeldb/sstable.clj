@@ -118,7 +118,21 @@
                          pairs
                          (io/scan-pairs sstable-path from-key to-key snapshot-seq))
                  pairs)
-               (rest tables)))))))))
+               (rest tables))))))))
+  (latest-seq
+    [this k]
+    (with-version
+      this
+      (fn [version]
+        ;; select-order is shallowest (newest) first; the first table (by
+        ;; precedence) that contains k holds its newest version, so its seq is the
+        ;; latest committed seq for k across the tree.
+        (loop [tables (select-order version)]
+          (when-let [[id table] (first tables)]
+            (if-let [s (and (blossom/hit? (:bloom-filter table) k)
+                            (io/read-latest-seq (get-sstable-path id dir) k))]
+              s
+              (recur (next tables)))))))))
 
 ;; ---- Version edits -------------------------------------------------------
 
