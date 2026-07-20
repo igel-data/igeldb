@@ -93,12 +93,14 @@
   3. deliver :done only AFTER applying, so read-your-writes holds: once a
      writer's `write!` returns, its value is already visible to readers.
 
-  `memstore` is locked only to guard these writes against concurrent reader
-  `select`/`scan`; no lock is held across the fsync."
+  The batch is applied as one atomic snapshot publish (`write-batch!`), so a
+  lock-free reader sees the pre-batch or post-batch memtable, never a torn
+  mid-batch view. This worker is the sole applier, preserving WAL-append order ==
+  memtable-apply order."
   [^BufferedOutputStream out-stream ^FileOutputStream file-stream batch memstore size]
   (try
     (.flush out-stream)
-    (-> file-stream .getFD .sync)
+    (-> file-stream .getChannel (.force true))
     (swap! fsync-count inc)
     (catch Throwable e
       ;; fsync/flush failed. Nothing was applied to the memtable yet, so there
@@ -108,10 +110,8 @@
       (doseq [[_ _ comp-chan] batch]
         (async/>!! comp-chan :error))
       (throw e)))
-  (locking memstore
-    (doseq [[k data _] batch]
-      (store/write-data! memstore k data)
-      (swap! size + (entry-size k data))))
+  (store/write-batch! memstore (mapv (fn [[k data _]] [k data]) batch))
+  (swap! size + (transduce (map (fn [[k data _]] (entry-size k data))) + 0 batch))
   (doseq [[_ _ comp-chan] batch]
     (async/>!! comp-chan :done)))
 

@@ -29,7 +29,7 @@
       (doseq [[k data] entry-set]
         (sstable/write-entry! out-stream bf k data))
       (.flush out-stream)
-      (-> file-stream .getFD .sync))
+      (-> file-stream .getChannel (.force true)))
     {:id new-id :level 0 :head-key head-key :tail-key tail-key
      :bloom-filter bf :size (.length (File. sstable-path))}))
 

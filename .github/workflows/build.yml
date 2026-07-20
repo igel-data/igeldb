@@ -37,3 +37,34 @@ jobs:
 
     - name: Run tests
       run: clojure -X:test
+
+  bb-smoke:
+    # Proves IgelDB loads under Babashka's SCI (no pod, no native binary) and the
+    # durable path works on bb: write -> flush -> select -> scan -> compaction ->
+    # reopen(recovery) -> verify. Deps come from bb.edn.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup Java
+      uses: actions/setup-java@v5
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Install Babashka + Clojure CLI
+      uses: DeLaGuardo/setup-clojure@13
+      with:
+        bb: latest
+        cli: 1.12.5.1654
+
+    - name: Cache m2 repository
+      uses: actions/cache@v6
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-bb-m2-${{ hashFiles('**/bb.edn') }}
+        restore-keys: |
+          ${{ runner.os }}-bb-m2-
+
+    - name: Run bb smoke test
+      run: bb test/bb_smoke.clj

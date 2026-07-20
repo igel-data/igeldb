@@ -154,15 +154,15 @@
   "Merge input file paths given LOW->HIGH precedence into a key-sorted seq of
   [k data], newest-wins. Drops tombstones when `drop-tombstones?`."
   [paths-low-to-high drop-tombstones?]
-  (let [tm (new java.util.TreeMap (data/byte-array-comparator))]
-    (doseq [path paths-low-to-high
-            [k data] (read-all-pairs path)]
-      (.put tm k data))
-    (->> (.entrySet tm)
-         (keep (fn [e]
-                 (let [d (.getValue e)]
-                   (when-not (and drop-tombstones? (:deleted? d))
-                     [(.getKey e) d])))))))
+  (let [merged (reduce (fn [m path]
+                         (reduce (fn [m [k data]] (assoc m k data))
+                                 m (read-all-pairs path)))
+                       (sorted-map-by (data/byte-array-comparator))
+                       paths-low-to-high)]
+    (keep (fn [[k data]]
+            (when-not (and drop-tombstones? (:deleted? data))
+              [k data]))
+          merged)))
 
 (defn- entry-bytes
   [^bytes k data]
@@ -183,7 +183,7 @@
 (defn- finish-table!
   [t out-level]
   (.flush ^BufferedOutputStream (:out-stream t))
-  (-> ^FileOutputStream (:file-stream t) .getFD .sync)
+  (-> ^FileOutputStream (:file-stream t) .getChannel (.force true))
   (.close ^BufferedOutputStream (:out-stream t))
   (.close ^FileOutputStream (:file-stream t))
   {:id (:id t) :level out-level

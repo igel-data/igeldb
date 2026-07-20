@@ -99,12 +99,23 @@
         (.wait monitor 200)
         (recur)))))
 
-(defn- run-mutation!
-  "Run a memtable mutation, applying the two settled error classes:
+(defn- unusable-ex
+  "Build the rejection exception for an unusable store. `poisoned` is either the
+  `:closed` marker (clean shutdown) or the fatal `Throwable` (an IO fault, kept as
+  the cause -- but only a Throwable can be an `ex-info` cause, hence the split)."
+  [poisoned op]
+  (if (= poisoned :closed)
+    (ex-info (str (name op) " rejected: the store is closed") {:retriable false})
+    (ex-info (str (name op) " rejected: the store is poisoned")
+             {:retriable false} poisoned)))
 
-  - Class B (fail-stop): if the store has been poisoned by an IO error, reject
-    the mutation immediately, and also if it becomes poisoned mid-flight. The
-    original fsync/flush failure is preserved as the exception cause.
+(defn- run-mutation!
+  "Run a memtable mutation, applying the settled error classes:
+
+  - Unusable store (fail-stop): if the store has been poisoned by an IO error, or
+    closed via `close!`, reject the mutation immediately -- and also if it becomes
+    unusable mid-flight. `poison` holds the fatal `Throwable` (a fault) or the
+    `:closed` marker; a fault is preserved as the exception cause.
   - Class C (retriable): a collision with a memtable switch throws
     {:retriable true}; retry up to `write-retries` times, then give up. The last
     retriable failure is preserved as the cause.
@@ -116,22 +127,21 @@
         monitor (:stall-monitor coordinator)
         threshold (:l0-stall-threshold config)]
     (loop [retries (:write-retries config)]
-      (when-let [e @poison]
-        (throw (ex-info (str (name op) " rejected: the store is poisoned")
-                        {:retriable false} e)))
-      ;; Stall before enqueueing while L0 is saturated (may be woken by poison).
+      (when-let [p @poison]
+        (throw (unusable-ex p op)))
+      ;; Stall before enqueueing while L0 is saturated (woken by a compaction, or
+      ;; by the store becoming unusable -- poisoned or closed).
       (await-l0-capacity! monitor (:current-version tree) poison threshold)
-      (when-let [e @poison]
-        (throw (ex-info (str (name op) " rejected: the store is poisoned")
-                        {:retriable false} e)))
+      (when-let [p @poison]
+        (throw (unusable-ex p op)))
       (let [err (try
                   (mutate!)
                   nil
                   (catch clojure.lang.ExceptionInfo e
                     (cond
-                      @poison
-                      (throw (ex-info (str (name op) " failed: the store is poisoned")
-                                      {:retriable false} @poison))
+                      ;; a closed wal-chan looks like a retriable memtable switch;
+                      ;; if the store is actually unusable, surface that instead
+                      @poison (throw (unusable-ex @poison op))
                       (-> e ex-data :retriable) e
                       :else (throw e))))]
         (when err
@@ -141,14 +151,25 @@
             (throw (ex-info (str (name op) " failed repeatedly")
                             {:retriable false} err))))))))
 
+(defn- reject-if-closed!
+  "Reads reject once the store is closed (a fully unusable store). A *fault*-
+  poisoned store (poison is a Throwable, not `:closed`) still serves reads: the
+  committed data on disk / in memory is intact, and Phase 1's fail-stop rejects
+  only writes."
+  [coordinator op]
+  (when (= :closed @(:poison coordinator))
+    (throw (ex-info (str (name op) " rejected: the store is closed") {}))))
+
 (defrecord KVS [config memtable tree coordinator]
   store/IStoreRead
   (select
     [_ k]
+    (reject-if-closed! coordinator :select)
     (let [data (or (store/select @memtable k) (store/select tree k))]
       (when (data/is-valid? data) (:value data))))
   (scan
     [_ from-key to-key]
+    (reject-if-closed! coordinator :scan)
     (->> (merge-scan-results (store/scan @memtable from-key to-key)
                              (store/scan tree from-key to-key))
          (filter (fn [[_ data]] (data/is-valid? data)))
@@ -164,13 +185,25 @@
     (run-mutation! coordinator tree config :delete
                    #(store/delete! @memtable k)))
   (write-data! [_ _ _] (throw (UnsupportedOperationException.)))
-
-  Object
-  (finalize [_]
-    (info "KVS is shutting down...")
-    (terminate-workers coordinator)))
+  (write-batch! [_ _] (throw (UnsupportedOperationException.))))
 
 ;; ==== Main APIs ====
+
+(defn close!
+  "Shut the store down: reject further writes, then stop the background workers.
+  Explicit shutdown (rather than an `Object.finalize` hook -- GC finalization is
+  unreliable and unsupported under Babashka's SCI records).
+
+  Closing marks the store unusable via the same `poison` atom used for fail-stop
+  (with a `:closed` marker instead of a fault), so every subsequent operation --
+  `write!`/`delete!` and `select`/`scan` -- fails fast with a clear \"store is
+  closed\" error, and any stalled writer is woken (the poison watch fires).
+  `compare-and-set!` leaves an existing fault in place so a poisoned-then-closed
+  store still reports its original cause."
+  [^KVS kvs]
+  (info "KVS is shutting down...")
+  (compare-and-set! (:poison (:coordinator kvs)) nil :closed)
+  (terminate-workers (:coordinator kvs)))
 
 (def ^:private ^:const INIT_TIMEOUT_MS 30000)
 

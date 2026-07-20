@@ -134,7 +134,7 @@
         wal-dir (str data-dir "/wal")]
     (let [kvs (igel/gen-kvs config-path)]
       (fill! kvs 128)
-      (.finalize kvs))
+      (igel/close! kvs))
     ;; at least one flush happened, so lower WAL ids were deleted -> id 0 is free
     (let [live-ids (->> (io/list-files wal-dir)
                         (filter #(.endsWith (.getName %) ".wal"))
@@ -146,14 +146,14 @@
                 os (BufferedOutputStream. fs)]
       (io/append-wal! os [(->bytes "stale-key") (data/new-data (->bytes "STALE"))])
       (.flush os)
-      (-> fs .getFD .sync))
+      (-> fs .getChannel (.force true)))
     (let [kvs (igel/gen-kvs config-path)]
       (is (b= (->bytes "val0") (igel/select kvs (->bytes "key0")))
           "committed data survives")
       (is (b= (->bytes "val120") (igel/select kvs (->bytes "key120"))))
       (is (nil? (igel/select kvs (->bytes "stale-key")))
           "the stale WAL was discarded, not replayed")
-      (.finalize kvs))
+      (igel/close! kvs))
     (rm-rf data-dir)))
 
 ;; ---- Step 1-3: unreferenced SSTable ignored on startup -------------------
@@ -164,7 +164,7 @@
         sstable-dir (str data-dir "/sstable")]
     (let [kvs (igel/gen-kvs config-path)]
       (fill! kvs 128)
-      (.finalize kvs))
+      (igel/close! kvs))
     ;; a stray .sst file not referenced by the manifest (e.g. a delete lost to a
     ;; crash, or a half-written orphan) must be ignored, not scanned
     (spit (str sstable-dir "/999999.sst") "garbage not a real sstable")
@@ -172,7 +172,7 @@
       (is (b= (->bytes "val0") (igel/select kvs (->bytes "key0")))
           "startup succeeds and committed data is intact")
       (is (nil? (igel/select kvs (->bytes "no-such-key"))))
-      (.finalize kvs))
+      (igel/close! kvs))
     (rm-rf data-dir)))
 
 ;; ---- Step 2: reads stay consistent across version swaps ------------------
@@ -203,5 +203,5 @@
       (doseq [r readers] @r))
     (is (empty? @errors)
         (str "reads threw during version swaps: " (first @errors)))
-    (.finalize kvs)
+    (igel/close! kvs)
     (rm-rf data-dir)))

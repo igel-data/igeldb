@@ -6,11 +6,23 @@
             [igeldb.manifest :as manifest]
             [igeldb.store :as store])
   (:import (java.io File)
-           (java.util.concurrent.locks Lock ReentrantReadWriteLock)))
+           (java.util.concurrent Semaphore)))
 
 (defn get-sstable-path
   [id dir]
   (str dir "/" id ".sst"))
+
+;; Reader/writer lock built on a Semaphore (Babashka has no
+;; ReentrantReadWriteLock). A reader takes one permit; a writer takes them all,
+;; so it excludes every reader. Fair mode keeps a waiting writer (a file
+;; deletion) from being starved by a stream of readers.
+(def ^:const ^:private RW_PERMITS 1000000)
+
+(defn- make-rw-lock [] (Semaphore. RW_PERMITS true))
+(defn- read-lock! [^Semaphore s] (.acquire s 1))
+(defn- read-unlock! [^Semaphore s] (.release s 1))
+(defn- write-lock! [^Semaphore s] (.acquire s RW_PERMITS))
+(defn- write-unlock! [^Semaphore s] (.release s RW_PERMITS))
 
 (defn next-id!
   "Atomically allocate the next monotonic SSTable id. Safe against concurrent
@@ -50,8 +62,8 @@
 
 (defn- scan-order
   "Tables in ascending read precedence (lowest first): deepest levels first, L0
-  last (ascending ID). `scan` merges into a TreeMap where the last put wins, so
-  the newest value must be put last."
+  last (ascending ID). `scan` merges into a sorted map where the last assoc wins,
+  so the newest value must be applied last."
   [version]
   (apply concat (reverse version)))
 
@@ -61,11 +73,11 @@
   a new version is never observed half-applied. Holding the read lock also blocks
   file deletion (Step 5) until this reader is done with the version's files."
   [tree f]
-  (let [^Lock rl (.readLock ^ReentrantReadWriteLock (:rw-lock tree))]
-    (.lock rl)
+  (let [sem (:rw-lock tree)]
+    (read-lock! sem)
     (try
       (f @(:current-version tree))
-      (finally (.unlock rl)))))
+      (finally (read-unlock! sem)))))
 
 (defrecord TreeStore [dir current-version rw-lock manifest]
   store/IStoreRead
@@ -88,10 +100,10 @@
     (with-version
       this
       (fn [version]
-        (loop [pairs (new java.util.TreeMap (data/byte-array-comparator))
+        (loop [pairs (sorted-map-by (data/byte-array-comparator))
                tables (scan-order version)]
           (if (empty? tables)
-            (->> pairs .entrySet (map (fn [e] [(.getKey e) (.getValue e)])))
+            (seq pairs)
             (let [[id table] (first tables)
                   head-key (:head-key table)
                   tail-key (:tail-key table)
@@ -99,12 +111,11 @@
               (recur
                (if (and (data/byte-array-smaller? head-key to-key)
                         (data/byte-array-smaller-or-equal? from-key tail-key))
-                 (reduce
-                  (fn [tree-map [k d]]
-                    (.put tree-map k d)
-                    tree-map)
-                  pairs
-                  (io/scan-pairs sstable-path from-key to-key))
+                 ;; last assoc wins, mirroring TreeMap `.put` -- scan-order feeds
+                 ;; tables lowest-precedence first, so the newest value survives
+                 (reduce (fn [m [k d]] (assoc m k d))
+                         pairs
+                         (io/scan-pairs sstable-path from-key to-key))
                  pairs)
                (rest tables)))))))))
 
@@ -178,8 +189,8 @@
   SSTables the manifest does not reference."
   [tree ids]
   (let [dir (:dir tree)
-        ^Lock write-lock (.writeLock ^ReentrantReadWriteLock (:rw-lock tree))]
-    (.lock write-lock)
+        sem (:rw-lock tree)]
+    (write-lock! sem)
     (try
       (doseq [id ids]
         (let [path (get-sstable-path id dir)
@@ -189,7 +200,7 @@
             (logging/warn "Superseded SSTable already gone (lost delete?):" path)
             (not (.delete f))
             (throw (ex-info "Failed to delete superseded SSTable" {:path path})))))
-      (finally (.unlock write-lock)))))
+      (finally (write-unlock! sem)))))
 
 ;; ---- Startup recovery ----------------------------------------------------
 
@@ -209,6 +220,6 @@
     (logging/info "Restored table set from manifest; next SSTable id" sstable-id)
     [(->TreeStore sstable-dir
                   (atom version)
-                  (ReentrantReadWriteLock. true)
+                  (make-rw-lock)
                   (manifest/open-manifest config))
      sstable-id]))

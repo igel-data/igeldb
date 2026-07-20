@@ -110,5 +110,5 @@
       (is (b= (->bytes (str i))
               (igel/select kvs (->bytes (format "t%d-k%04d" t i))))
           (str "lost write t" t "-k" i)))
-    (.finalize kvs)
+    (igel/close! kvs)
     (rm-rf data-dir)))

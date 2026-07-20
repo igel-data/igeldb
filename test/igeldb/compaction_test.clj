@@ -75,7 +75,7 @@
       (io/write-bytes! os (->bytes k))
       (if v (io/write-bytes! os (->bytes v)) (io/write-tombstone! os)))
     (.flush os)
-    (-> fs .getFD .sync)))
+    (-> fs .getChannel (.force true))))
 
 (deftest merge-newest-wins-and-tombstone-at-bottom-test
   (let [dir "./test-data/compaction-merge"]
@@ -164,7 +164,7 @@
         (doseq [[[_ a] [_ b]] (partition 2 1 sorted)]
           (is (data/byte-array-smaller? (:tail-key a) (:head-key b))
               (str "L" level " tables overlap")))))
-    (.finalize kvs)
+    (igel/close! kvs)
     (rm-rf data-dir)))
 
 ;; ---- integration: newest value wins across compaction --------------------
@@ -180,7 +180,7 @@
     (wait-until #(l1+-populated? kvs))
     (is (b= (->bytes "new") (igel/select kvs (->bytes "hot")))
         "the newest value wins across levels and compaction")
-    (.finalize kvs)
+    (igel/close! kvs)
     (rm-rf data-dir)))
 
 ;; ---- integration: deletes survive compaction (no resurrection) -----------
@@ -196,7 +196,7 @@
     (wait-until #(l1+-populated? kvs))
     (is (nil? (igel/select kvs (->bytes "gone")))
         "a deleted key stays deleted through compaction (no resurrection)")
-    (.finalize kvs)
+    (igel/close! kvs)
     (rm-rf data-dir)))
 
 ;; ---- Step 5: deferred-safe physical deletion -----------------------------
@@ -225,7 +225,7 @@
     (is (empty? @errors)
         (str "reads threw during concurrent compaction+deletion: "
              (first @errors)))
-    (.finalize kvs)
+    (igel/close! kvs)
     (rm-rf data-dir)))
 
 (deftest superseded-input-files-are-deleted-test
@@ -241,5 +241,5 @@
       (is (= referenced on-disk)
           (str "superseded files not cleaned / referenced file missing"
                " -- version=" referenced " disk=" on-disk)))
-    (.finalize kvs)
+    (igel/close! kvs)
     (rm-rf data-dir)))

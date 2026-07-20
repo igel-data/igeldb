@@ -4,51 +4,50 @@
             [igeldb.store :as store :refer [select scan]]
             [igeldb.wal :as wal]))
 
-(defrecord MemStore [^java.util.TreeMap mem]
+;; The memtable store is an atom holding an *immutable* sorted map (sorted by the
+;; same unsigned byte-array comparator as the SSTables). It is swapped, never
+;; mutated in place: readers deref a snapshot lock-free, and the group-commit
+;; worker publishes each batch with a single atomic `swap!`, so a reader sees the
+;; pre-batch or post-batch map, never a torn mid-batch view. (A Babashka-friendly
+;; requirement too: bb has no java.util.TreeMap.)
+(defrecord MemStore [store]
   store/IStoreRead
   (select
     [_ k]
-    (let [data (.get mem k)]
-      (when (seq data)
-        (if (data/is-valid? data) data (data/deleted-data)))))
+    ;; the stored value is a Data (a live value or a tombstone) or nil; a
+    ;; tombstone must be returned (truthy) so it shadows deeper levels
+    (get @store k))
   (scan
     [_ from-key to-key]
-    ;; Realize eagerly (mapv): `Memtable/scan` calls this under `(locking mem)`,
-    ;; but the caller consumes the result after the lock is released. A lazy seq
-    ;; over the live TreeMap's entry view would then be iterated while the flush
-    ;; worker mutates the memtable -> ConcurrentModificationException.
-    (some->> (.subMap mem from-key true to-key false)
-             .entrySet
-             (mapv
-              (fn [e]
-                (let [k (.getKey e)
-                      data (.getValue e)]
-                  (if (data/is-valid? data)
-                    [k data]
-                    [k (data/deleted-data)]))))))
+    ;; from-inclusive, to-exclusive -- matches TreeMap's subMap(from,true,to,false)
+    (mapv (fn [[k data]] [k data])
+          (subseq @store >= from-key < to-key)))
 
   store/IStoreMutate
   (write!
     [_ k v]
-    (.put mem k (data/new-data v)))
+    (swap! store assoc k (data/new-data v)))
   (write-data!
     [_ k data]
-    (.put mem k data))
+    (swap! store assoc k data))
+  (write-batch!
+    [_ entries]
+    ;; apply the whole batch in one atomic swap, in order (last wins)
+    (swap! store (fn [m] (reduce (fn [m [k data]] (assoc m k data)) m entries))))
   (delete!
     [_ k]
-    (.put mem k (data/deleted-data))))
+    (swap! store assoc k (data/deleted-data))))
 
 (defrecord Memtable [mem wal-chan size]
   store/IStoreRead
-  ;; TODO: need concurrent BTreeMap
+  ;; Reads are lock-free: the store is an immutable snapshot behind an atom, so
+  ;; there is nothing to guard against the (single) writer.
   (select
     [_ k]
-    (locking mem
-      (select mem k)))
+    (select mem k))
   (scan
     [_ from-key to-key]
-    (locking mem
-      (scan mem from-key to-key)))
+    (scan mem from-key to-key))
 
   store/IStoreMutate
   ;; Writers only enqueue to the WAL channel and wait for the group-commit
@@ -69,6 +68,7 @@
                             {:retriable true}))
         (throw (ex-info "Write failed" {:retriable false})))))
   (write-data! [_ _ _] (throw (UnsupportedOperationException.)))
+  (write-batch! [_ _] (throw (UnsupportedOperationException.)))
   (delete!
     [_ k]
     (let [comp-chan (async/chan)]
@@ -81,12 +81,13 @@
                             {:retriable true}))
         (throw (ex-info "Delete failed" {:retriable false}))))))
 
+(defn- empty-store []
+  (->MemStore (atom (sorted-map-by (data/byte-array-comparator)))))
+
 (defn create-memtable
   "Create the new memtable"
   [wal-chan]
-  (->Memtable (->MemStore (new java.util.TreeMap (data/byte-array-comparator)))
-              wal-chan
-              (atom 0)))
+  (->Memtable (empty-store) wal-chan (atom 0)))
 
 (defn init-memtable
   "Initialize the memtable, restoring data from the WAL. Returns
@@ -98,18 +99,17 @@
   initial flush; a restored one flushes immediately to commit the WAL) and lines
   up with the flush threshold check."
   [wal-chan config]
-  (let [store (->MemStore (new java.util.TreeMap (data/byte-array-comparator)))
+  (let [store (empty-store)
         [wal-id wal-pairs] (wal/load-existing-wal config)]
     ;; `load-existing-wal` returns [k data] entries (data is a value or a
     ;; tombstone). Apply them in WAL order so the replayed memtable matches the
     ;; pre-crash state.
-    (doseq [[k data] wal-pairs]
-      (store/write-data! store k data))
+    (store/write-batch! store wal-pairs)
     (let [size (reduce (fn [acc [k data]] (+ acc (wal/entry-size k data)))
                        0 wal-pairs)]
       [wal-id (->Memtable store wal-chan (atom size))])))
 
 (defn entry-set
+  "The memtable's [k data] entries in key order (an immutable snapshot)."
   [^Memtable memtable]
-  (->> memtable :mem :mem .entrySet
-       (map (fn [e] [(.getKey e) (.getValue e)]))))
+  (mapv (fn [[k data]] [k data]) @(:store (:mem memtable))))

@@ -122,7 +122,32 @@
         kvs (igel/gen-kvs config-path)]
     (is (nil? (igel/select kvs (.getBytes "no-such-key"))))
     (is (empty? (igel/scan kvs (.getBytes "a") (.getBytes "z"))))
-    (.finalize kvs)
+    (igel/close! kvs)
+    (delete-test-dir! (io/file data-dir) false)))
+
+(deftest close-rejects-operations-test
+  ;; After `close!` a store is fully unusable: writes, deletes, and reads all fail
+  ;; fast with a clear error (via the poison mechanism's `:closed` marker).
+  (let [data-dir (str "./test-data/close-rejects-operations-test")
+        test-config (make-test-config data-dir)
+        config-path (setup-test! data-dir test-config)
+        kvs (igel/gen-kvs config-path)]
+    (igel/write! kvs (.getBytes "k") (.getBytes "v"))
+    (igel/close! kvs)
+    ;; writes are rejected fast and non-retriably (not a ~1s retry loop)
+    (let [start (System/currentTimeMillis)
+          ex (is (thrown-with-msg? clojure.lang.ExceptionInfo #"store is closed"
+                                   (igel/write! kvs (.getBytes "k2") (.getBytes "v2"))))]
+      (is (false? (:retriable (ex-data ex))))
+      (is (< (- (System/currentTimeMillis) start) 500)
+          "rejection is immediate"))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"store is closed"
+                          (igel/delete! kvs (.getBytes "k"))))
+    ;; reads are rejected too
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"store is closed"
+                          (igel/select kvs (.getBytes "k"))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"store is closed"
+                          (igel/scan kvs (.getBytes "a") (.getBytes "z"))))
     (delete-test-dir! (io/file data-dir) false)))
 
 (deftest restore-test
@@ -135,7 +160,7 @@
         (let [k (.getBytes (str "key" i))
               v (.getBytes (str "val" i))]
           (igel/write! kvs k v)))
-      (.finalize kvs))
+      (igel/close! kvs))
     ;; drop the current kvs and restart
     (let [kvs (igel/gen-kvs config-path)]
       (doseq [i (range 0 NUM_ITEMS)]
@@ -190,7 +215,7 @@
     (is (< (* 2 @wal/fsync-count) num-writes)
         (str "Group commit did not batch: fsyncs=" @wal/fsync-count
              " writes=" num-writes))
-    (.finalize kvs)
+    (igel/close! kvs)
     (delete-test-dir! (io/file data-dir) false)))
 
 (deftest concurrent-same-key-invariant-test
@@ -212,7 +237,7 @@
                                  (igel/write! kvs k (.getBytes (str "val-" t))))))]
                      (doseq [f fs] @f))
                    (let [v (igel/select kvs k)]
-                     (.finalize kvs)
+                     (igel/close! kvs)
                      v))]
       (is (some? before) "A concurrent write to the key should have survived")
       ;; restart -> replay the WAL -> the surviving value must be identical
@@ -222,5 +247,5 @@
             (str "Value diverged across restart (round " round "): before="
                  (when before (String. before))
                  " after=" (when after (String. after))))
-        (.finalize kvs))
+        (igel/close! kvs))
       (delete-test-dir! (io/file data-dir) false))))

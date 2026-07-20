@@ -15,4 +15,8 @@
   ;; Used by the group-commit worker to apply a batch to the memtable after
   ;; the WAL fsync completes, preserving the exact data enqueued by the writer.
   (write-data! [this ^bytes k data])
+  ;; Apply a whole batch of [k data] pairs (in order, last wins) as one atomic
+  ;; snapshot publish, so a lock-free reader sees the pre-batch or post-batch
+  ;; state, never a torn mid-batch view. The group-commit worker uses this.
+  (write-batch! [this entries])
   (delete! [this ^bytes k]))

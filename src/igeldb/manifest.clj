@@ -11,38 +11,90 @@
   The manifest tracks only SSTable state. The WAL ID is recovered separately from
   the WAL directory (see `igeldb.wal/load-existing-wal`).
 
-  Encoding: each edit is Fressian-serialized to bytes, then framed with the Phase
-  1 length + CRC envelope (`io/write-bytes!` / `io/read-data!`), so the Phase 1
-  corruption classes apply directly.
+  Encoding: each edit is encoded to bytes with the project's own explicit binary
+  format (see `edit->bytes`), then framed with the Phase 1 length + CRC envelope
+  (`io/write-bytes!` / `io/read-data!`), so the Phase 1 corruption classes apply
+  directly. There is no per-field CRC here -- the outer frame CRCs the whole
+  edit, so `bytes->edit` only ever runs on already-verified bytes.
+
+  The self-made format keeps IgelDB pure-Clojure/Babashka-compatible: it uses
+  only `DataOutputStream`/`DataInputStream` (bb-safe), unlike Fressian.
 
   In an edit passed to/from this namespace, `:bloom-filter` is the *serialized
-  bytes* of the filter (Fressian cannot serialize the filter object); callers
-  deserialize on replay.
+  bytes* of the filter (byte[]), `:head-key`/`:tail-key` are byte[] keys, and
+  `:id`/`:level`/`:size` are longs.
 
   TODO (manifest rotation, deferred): the manifest grows unbounded. Rotation will
   snapshot the full current table set into a fresh manifest and atomically swap it
   in (LevelDB's CURRENT/MANIFEST swap), then discard the old manifest."
-  (:require [clojure.data.fressian :as fress]
-            [clojure.java.io :as java-io]
+  (:require [clojure.java.io :as java-io]
             [clojure.tools.logging :as logging]
             [igeldb.io :as io])
-  (:import (java.io FileOutputStream BufferedOutputStream)))
+  (:import (java.io FileOutputStream BufferedOutputStream
+                    ByteArrayOutputStream ByteArrayInputStream
+                    DataOutputStream DataInputStream)))
 
 (defn manifest-path
   "Path of the single append-only manifest file (lives beside the SSTables)."
   [config]
   (str (:sstable-dir config) "/MANIFEST"))
 
+;; Binary layout of one edit (all longs are 8-byte big-endian, matching
+;; `io/serialize-long`; each byte[] is a long length prefix then the raw bytes):
+;;   long   addedCount
+;;   repeat addedCount: long id, long level, long size,
+;;                      long headLen, bytes head, long tailLen, bytes tail,
+;;                      long bloomLen, bytes bloom
+;;   long   deletedCount
+;;   repeat deletedCount: long id
+
+(defn- write-bytes-field!
+  [^DataOutputStream out ^bytes b]
+  (.writeLong out (count b))
+  (.write out b))
+
+(defn- read-bytes-field!
+  [^DataInputStream in]
+  (let [buf (byte-array (.readLong in))]
+    (.readFully in buf)
+    buf))
+
 (defn- edit->bytes
-  [edit]
-  (let [bb (fress/write edit)
-        arr (byte-array (.remaining bb))]
-    (.get bb arr)
-    arr))
+  [{:keys [added deleted]}]
+  (let [baos (ByteArrayOutputStream.)
+        out (DataOutputStream. baos)]
+    (.writeLong out (count added))
+    (doseq [{:keys [id level size head-key tail-key bloom-filter]} added]
+      (.writeLong out id)
+      (.writeLong out level)
+      (.writeLong out size)
+      (write-bytes-field! out head-key)
+      (write-bytes-field! out tail-key)
+      (write-bytes-field! out bloom-filter))
+    (.writeLong out (count deleted))
+    (doseq [id deleted]
+      (.writeLong out id))
+    (.flush out)
+    (.toByteArray baos)))
 
 (defn- bytes->edit
   [^bytes b]
-  (fress/read b))
+  (let [in (DataInputStream. (ByteArrayInputStream. b))
+        added (mapv (fn [_]
+                      ;; explicit let so the field reads happen in order
+                      (let [id (.readLong in)
+                            level (.readLong in)
+                            size (.readLong in)
+                            head-key (read-bytes-field! in)
+                            tail-key (read-bytes-field! in)
+                            bloom-filter (read-bytes-field! in)]
+                        {:id id :level level :size size
+                         :head-key head-key :tail-key tail-key
+                         :bloom-filter bloom-filter}))
+                    (range (.readLong in)))
+        deleted (mapv (fn [_] (.readLong in))
+                      (range (.readLong in)))]
+    {:added added :deleted deleted}))
 
 (defn read-edits
   "Replay every committed edit from the manifest, in append order. Reuses the
@@ -85,7 +137,7 @@
   [manifest edit]
   (io/write-bytes! (:out-stream manifest) (edit->bytes edit))
   (.flush ^BufferedOutputStream (:out-stream manifest))
-  (-> ^FileOutputStream (:file-stream manifest) .getFD .sync))
+  (-> ^FileOutputStream (:file-stream manifest) .getChannel (.force true)))
 
 (defn close!
   "Close the manifest's append stream."

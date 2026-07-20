@@ -29,7 +29,7 @@
     (doseq [[k v] entries]
       (io/append-wal! os [k (if v (data/new-data v) (data/deleted-data))]))
     (.flush os)
-    (-> fs .getFD .sync)))
+    (-> fs .getChannel (.force true))))
 
 (defn- truncate-file!
   [path new-len]
