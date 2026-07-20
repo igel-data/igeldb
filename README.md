@@ -1,16 +1,39 @@
 # IgelDB
 
-Simple Key-Value Store based on LSM Tree
+An embeddable key-value store for the Clojure ecosystem — pure Clojure, zero native
+dependencies, and usable directly from [Babashka](https://babashka.org/) with no pod and no
+native binary. Just add it to your classpath.
 
-The written data is persisted into the disk. The memtable (write buffer on memory) is protected by WAL(write ahead logging).
+Built on an LSM tree with leveled compaction, IgelDB persists every write to disk and is
+designed to be crash-safe: durability isn't an afterthought but a tested property.
 
-## TODO
-- ~~WAL~~
-- Compaction
-- Error handling
-- Background ~~flush~~/compaction
-- Concurrency
-- Indexing
+## Why IgelDB
+
+- **Drop-in for Babashka.** Unlike stores that ship a native binary (and reintroduce the
+  per-OS/per-arch distribution problem), IgelDB is pure Clojure. It loads on a Babashka
+  classpath as-is — no pod process, no compiled artifact to build or match to your platform.
+- **Zero native dependencies.** Runs on plain JVM bytecode, so distribution and debugging on
+  multi-architecture environments (e.g. mixed-arch Kubernetes) stay simple.
+- **Crash-safe by design.** Every write goes through a write-ahead log with `fsync`-backed
+  group commit; the memtable is only updated after the WAL is durably persisted. Compaction
+  and the manifest are structured so a crash at any point recovers to a consistent state.
+  These properties are covered by tests, including crash-recovery paths.
+- **Lightweight footprint.** Small defaults tuned for embedding in an application process.
+  Everything (memtable size, compaction thresholds, level sizing) is configurable. For
+  hundreds-of-GB workloads, reach for RocksDB — IgelDB targets the embedded niche.
+- **Concurrent reads.** Readers work against an immutable snapshot with no locking, so reads
+  proceed concurrently with writes and compaction.
+
+## Design
+
+- **LSM tree** with a memtable (an immutable sorted map, swapped atomically), on-disk
+  SSTables, and **leveled compaction**.
+- **Write path:** WAL append → `fsync` (group-committed) → memtable apply → return. A single
+  commit worker applies each batch in WAL order, so WAL order and memtable order always match.
+- **Manifest:** an append-only log of version edits (added/deleted tables), `fsync`-committed;
+  startup rebuilds state by replaying it. A crash between steps recovers cleanly.
+- **Bloom filters** on SSTables (via [blossom](https://github.com/yito88/blossom)) skip disk
+  reads on misses.
 
 ## Usage
 
@@ -58,23 +81,36 @@ The written data is persisted into the disk. The memtable (write buffer on memor
 (map (fn [[k v]] [(String. k) (String. v)])
      (igel/scan kvs from-key to-key))
 ; -> (["key1" "val1"])
+
+;; Close the store when done: flushes and releases resources.
+;; After close!, reads and writes are rejected.
+(igel/close! kvs)
 ```
+
+Keys and values are `byte[]`. Serialize your own values to bytes before writing.
+
+### Babashka
+
+IgelDB runs under Babashka with no extra setup — add `src` and the runtime deps to your
+classpath and `require` it as usual. See [`test/bb_smoke.clj`](test/bb_smoke.clj) for a
+full write → flush → compaction → reopen (recovery) cycle running on `bb`.
 
 ## Configuration
 
-FIXME: listing of parameters
+Configuration is a YAML file (see `gen-kvs`). Key parameters:
+
+| Key | Meaning |
+| --- | --- |
+| `sstable-dir` / `wal-dir` | Directories for SSTables and WAL files |
+| `memtable-size` | Flush threshold; write buffer size before flushing to an SSTable |
+| `sync-window-time` | Group-commit window (ms) for batching `fsync` |
+| `l0-compaction-trigger` | L0 table count that triggers L0→L1 compaction |
+| `l0-stall-threshold` | L0 table count at which writers stall (back-pressure safety valve) |
+| `level-size-multiplier` | Per-level size growth factor |
 
 ## License
 
 Copyright © 2023 Yuji Ito
 
-This program and the accompanying materials are made available under the
-terms of the Eclipse Public License 2.0 which is available at
-http://www.eclipse.org/legal/epl-2.0.
-
-This Source Code may also be made available under the following Secondary
-Licenses when the conditions for such availability set forth in the Eclipse
-Public License, v. 2.0 are satisfied: GNU General Public License as published by
-the Free Software Foundation, either version 2 of the License, or (at your
-option) any later version, with the GNU Classpath Exception which is available
-at https://www.gnu.org/software/classpath/license.html.
+Distributed under the Eclipse Public License 2.0 (or the secondary licenses it
+allows). See [LICENSE](LICENSE) for details.
