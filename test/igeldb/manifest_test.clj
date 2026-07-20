@@ -144,7 +144,8 @@
     ;; drop a stale, lower-id WAL whose key was never written
     (with-open [fs (FileOutputStream. (str wal-dir "/0.wal"))
                 os (BufferedOutputStream. fs)]
-      (io/append-wal! os [(->bytes "stale-key") (data/new-data (->bytes "STALE"))])
+      (io/append-entry! os [(data/->ikey (->bytes "stale-key") 1)
+                            (data/new-data (->bytes "STALE"))])
       (.flush os)
       (-> fs .getChannel (.force true)))
     (let [kvs (igel/gen-kvs config-path)]

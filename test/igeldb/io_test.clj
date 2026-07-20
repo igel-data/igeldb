@@ -22,12 +22,13 @@
 
 (defn- write-wal-file!
   "Write entries to a WAL file. Each entry is [k-bytes v-bytes]; a nil value
-  writes a tombstone."
+  writes a tombstone. Seqs are assigned 1, 2, 3, ..."
   [path entries]
   (with-open [fs (FileOutputStream. path)
               os (BufferedOutputStream. fs)]
-    (doseq [[k v] entries]
-      (io/append-wal! os [k (if v (data/new-data v) (data/deleted-data))]))
+    (doseq [[i [k v]] (map-indexed vector entries)]
+      (io/append-entry! os [(data/->ikey k (inc i))
+                            (if v (data/new-data v) (data/deleted-data))]))
     (.flush os)
     (-> fs .getChannel (.force true))))
 
@@ -58,12 +59,13 @@
               e2 (io/read-kv-pair! in)
               e3 (io/read-kv-pair! in)
               e4 (io/read-kv-pair! in)]
-          (is (data/byte-array-equals? (.getBytes "k1") (first e1)))
+          (is (data/byte-array-equals? (.getBytes "k1") (:user-key (first e1))))
+          (is (= 1 (:seq (first e1))) "seq is decoded from the key segment")
           (is (data/is-valid? (second e1)))
           (is (data/byte-array-equals? (.getBytes "v1") (:value (second e1))))
-          (is (data/byte-array-equals? (.getBytes "k2") (first e2)))
+          (is (data/byte-array-equals? (.getBytes "k2") (:user-key (first e2))))
           (is (not (data/is-valid? (second e2))) "k2 is a tombstone")
-          (is (data/byte-array-equals? (.getBytes "k3") (first e3)))
+          (is (data/byte-array-equals? (.getBytes "k3") (:user-key (first e3))))
           (is (= :eof e4) "reading past the last entry yields :eof"))))))
 
 (deftest tail-truncation-is-truncated-test
@@ -84,9 +86,9 @@
   ;; intact, so the whole segment is read but the CRC no longer matches.
   (let [path (str TMP_DIR "/corrupt.wal")]
     (write-wal-file! path entries)
-    ;; layout of entry 1: key seg (8 len + 2 data + 8 crc = 18) then value seg;
-    ;; offset 26 is the first byte of "v1".
-    (flip-byte! path 26)
+    ;; entry 1 key seg = 8 len + (8 seq + 2 key) + 8 crc = 26; value seg len is
+    ;; 26-33, so offset 34 is the first byte of "v1".
+    (flip-byte! path 34)
     (with-open [in (jio/input-stream path)]
       (is (= :corrupt (io/read-kv-pair! in)) "CRC mismatch surfaces as :corrupt"))))
 
@@ -100,15 +102,15 @@
     (let [[wal-id pairs] (wal/load-existing-wal {:wal-dir wal-dir})]
       (is (= 0 wal-id) "the WAL id comes from the filename")
       (is (= 2 (count pairs)) "only the two intact entries are replayed")
-      (is (data/byte-array-equals? (.getBytes "k1") (ffirst pairs)))
-      (is (data/byte-array-equals? (.getBytes "k2") (first (second pairs)))))))
+      (is (data/byte-array-equals? (.getBytes "k1") (:user-key (ffirst pairs))))
+      (is (data/byte-array-equals? (.getBytes "k2") (:user-key (first (second pairs))))))))
 
 (deftest load-existing-wal-midfile-corruption-throws-test
   (let [wal-dir (str TMP_DIR "/wal-corrupt")]
     (io/make-dir wal-dir)
     (let [path (str wal-dir "/0.wal")]
       (write-wal-file! path entries)
-      (flip-byte! path 26))
+      (flip-byte! path 34)) ;; corrupt entry 1's value data (see layout above)
     (is (thrown? clojure.lang.ExceptionInfo
                  (wal/load-existing-wal {:wal-dir wal-dir}))
         "mid-file corruption must raise, not silently truncate the log")))

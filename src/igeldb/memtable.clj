@@ -1,65 +1,88 @@
 (ns igeldb.memtable
   (:require [clojure.core.async :as async]
             [igeldb.data :as data]
-            [igeldb.store :as store :refer [select scan]]
+            [igeldb.store :as store]
             [igeldb.wal :as wal]))
 
-;; The memtable store is an atom holding an *immutable* sorted map (sorted by the
-;; same unsigned byte-array comparator as the SSTables). It is swapped, never
-;; mutated in place: readers deref a snapshot lock-free, and the group-commit
-;; worker publishes each batch with a single atomic `swap!`, so a reader sees the
-;; pre-batch or post-batch map, never a torn mid-batch view. (A Babashka-friendly
-;; requirement too: bb has no java.util.TreeMap.)
+;; The memtable store is an atom holding an *immutable* sorted map keyed by
+;; InternalKey (user_key asc, seq desc). It is swapped, never mutated in place:
+;; readers deref a snapshot lock-free, and the group-commit worker publishes each
+;; batch with a single atomic `swap!`, so a reader sees the pre-batch or
+;; post-batch map, never a torn mid-batch view. (A Babashka-friendly requirement
+;; too: bb has no java.util.TreeMap.)
+;;
+;; Multiple versions of a user_key can coexist (one per committing tx). A read at
+;; `snapshot-seq` seeks `(->ikey user_key snapshot-seq)`: the first entry
+;; at-or-after it with the same user_key is the newest version with seq <=
+;; snapshot (seq-desc ordering puts newer versions first).
+
+(defn- newest-visible
+  "The [ikey data] of the newest version of user_key `k` with seq <= snapshot in
+  the sorted map `m`, or nil."
+  [m ^bytes k snapshot-seq]
+  (when-let [[ikey data] (first (subseq m >= (data/->ikey k snapshot-seq)))]
+    (when (data/byte-array-equals? (:user-key ikey) k)
+      [ikey data])))
+
 (defrecord MemStore [store]
   store/IStoreRead
   (select
-    [_ k]
-    ;; the stored value is a Data (a live value or a tombstone) or nil; a
-    ;; tombstone must be returned (truthy) so it shadows deeper levels
-    (get @store k))
+    [_ k snapshot-seq]
+    ;; return the Data of the newest visible version (a value or a tombstone,
+    ;; which must be truthy so it shadows deeper levels), or nil
+    (second (newest-visible @store k snapshot-seq)))
   (scan
-    [_ from-key to-key]
-    ;; from-inclusive, to-exclusive -- matches TreeMap's subMap(from,true,to,false)
-    (mapv (fn [[k data]] [k data])
-          (subseq @store >= from-key < to-key)))
+    [_ from-key to-key snapshot-seq]
+    ;; [from, to) on user_keys; for each user_key its newest version <= snapshot.
+    ;; Entries are user_key-asc / seq-desc, so within a user_key group the first
+    ;; entry with seq <= snapshot wins.
+    (loop [es (subseq @store
+                      >= (data/->ikey from-key Long/MAX_VALUE)
+                      < (data/->ikey to-key Long/MAX_VALUE))
+           acc (transient [])
+           emitted nil]
+      (if (empty? es)
+        (persistent! acc)
+        (let [[ikey data] (first es)
+              uk (:user-key ikey)]
+          (cond
+            (and emitted (data/byte-array-equals? uk emitted)) (recur (rest es) acc emitted)
+            (> (:seq ikey) snapshot-seq) (recur (rest es) acc emitted)
+            :else (recur (rest es) (conj! acc [uk data]) uk))))))
 
   store/IStoreMutate
-  (write!
-    [_ k v]
-    (swap! store assoc k (data/new-data v)))
-  (write-data!
-    [_ k data]
-    (swap! store assoc k data))
+  ;; The worker applies whole batches via write-batch!; the single-op mutators are
+  ;; not the memtable's write path (seq is assigned in `Memtable`, above the store).
+  (write! [_ _ _] (throw (UnsupportedOperationException.)))
+  (write-data! [_ _ _] (throw (UnsupportedOperationException.)))
   (write-batch!
     [_ entries]
-    ;; apply the whole batch in one atomic swap, in order (last wins)
-    (swap! store (fn [m] (reduce (fn [m [k data]] (assoc m k data)) m entries))))
-  (delete!
-    [_ k]
-    (swap! store assoc k (data/deleted-data))))
+    ;; entries are [ikey data]; apply the whole batch in one atomic swap, in order
+    (swap! store (fn [m] (reduce (fn [m [ikey d]] (assoc m ikey d)) m entries))))
+  (delete! [_ _] (throw (UnsupportedOperationException.))))
 
-(defrecord Memtable [mem wal-chan size]
+(defrecord Memtable [mem wal-chan size seq-counter]
   store/IStoreRead
-  ;; Reads are lock-free: the store is an immutable snapshot behind an atom, so
-  ;; there is nothing to guard against the (single) writer.
+  ;; Reads are lock-free over an immutable snapshot behind an atom.
   (select
-    [_ k]
-    (select mem k))
+    [_ k snapshot-seq]
+    (store/select mem k snapshot-seq))
   (scan
-    [_ from-key to-key]
-    (scan mem from-key to-key))
+    [_ from-key to-key snapshot-seq]
+    (store/scan mem from-key to-key snapshot-seq))
 
   store/IStoreMutate
-  ;; Writers only enqueue to the WAL channel and wait for the group-commit
-  ;; worker to signal completion. The worker (a single thread) appends to the
-  ;; WAL, fsyncs, then applies the entry to the memtable and updates `size` --
-  ;; the writer never touches the memtable or holds a lock across the fsync.
-  ;; This keeps WAL-append order == memtable-apply order and makes rollback on
-  ;; fsync failure unnecessary (nothing is applied until fsync succeeds).
+  ;; Writers assign a seq, then enqueue an InternalKey entry to the WAL channel and
+  ;; wait for the group-commit worker. The worker (a single thread) appends to the
+  ;; WAL, fsyncs, then applies the batch to the memtable -- keeping WAL-append
+  ;; order == memtable-apply order == seq order, and making rollback on fsync
+  ;; failure unnecessary. (Step 1: seq is a global counter per write; Step 4 moves
+  ;; seq assignment into the commit-handler.)
   (write!
     [_ k v]
-    (let [comp-chan (async/chan)]
-      (when-not (async/>!! wal-chan [k (data/new-data v) comp-chan])
+    (let [ikey (data/->ikey k (swap! seq-counter inc))
+          comp-chan (async/chan)]
+      (when-not (async/>!! wal-chan [ikey (data/new-data v) comp-chan])
         (throw (ex-info "Write failed due to memtable switching"
                         {:retriable true})))
       (case (async/<!! comp-chan)
@@ -71,8 +94,9 @@
   (write-batch! [_ _] (throw (UnsupportedOperationException.)))
   (delete!
     [_ k]
-    (let [comp-chan (async/chan)]
-      (when-not (async/>!! wal-chan [k (data/deleted-data) comp-chan])
+    (let [ikey (data/->ikey k (swap! seq-counter inc))
+          comp-chan (async/chan)]
+      (when-not (async/>!! wal-chan [ikey (data/deleted-data) comp-chan])
         (throw (ex-info "Delete failed due to memtable switching"
                         {:retriable true})))
       (case (async/<!! comp-chan)
@@ -82,34 +106,30 @@
         (throw (ex-info "Delete failed" {:retriable false}))))))
 
 (defn- empty-store []
-  (->MemStore (atom (sorted-map-by (data/byte-array-comparator)))))
+  (->MemStore (atom (sorted-map-by (data/internal-key-comparator)))))
 
 (defn create-memtable
-  "Create the new memtable"
-  [wal-chan]
-  (->Memtable (empty-store) wal-chan (atom 0)))
+  "Create a new (empty) memtable sharing the global `seq-counter`."
+  [wal-chan seq-counter]
+  (->Memtable (empty-store) wal-chan (atom 0) seq-counter))
 
 (defn init-memtable
-  "Initialize the memtable, restoring data from the WAL. Returns
-  `[wal-id memtable]`: `wal-id` is the ID of the replayed WAL (0 if none), used
-  to seed the WAL counter.
-
-  The `size` is the *actual* byte size of the replayed entries -- no fabricated
-  value. This makes the zero-check in `flush!` correct (an empty store skips the
-  initial flush; a restored one flushes immediately to commit the WAL) and lines
-  up with the flush threshold check."
-  [wal-chan config]
+  "Initialize the memtable, restoring data from the WAL. Returns `[wal-id
+  memtable]`. Seeds the shared `seq-counter` to the max replayed seq so new writes
+  get higher seqs (Step 7 also folds in the manifest max-seq). The `size` is the
+  actual byte size of the replayed entries."
+  [wal-chan seq-counter config]
   (let [store (empty-store)
         [wal-id wal-pairs] (wal/load-existing-wal config)]
-    ;; `load-existing-wal` returns [k data] entries (data is a value or a
-    ;; tombstone). Apply them in WAL order so the replayed memtable matches the
-    ;; pre-crash state.
+    ;; `load-existing-wal` returns [ikey data] entries; apply them in WAL order so
+    ;; the replayed memtable matches the pre-crash state.
     (store/write-batch! store wal-pairs)
-    (let [size (reduce (fn [acc [k data]] (+ acc (wal/entry-size k data)))
+    (reset! seq-counter (reduce (fn [m [ikey _]] (max m (:seq ikey))) 0 wal-pairs))
+    (let [size (reduce (fn [acc [ikey data]] (+ acc (wal/entry-size ikey data)))
                        0 wal-pairs)]
-      [wal-id (->Memtable store wal-chan (atom size))])))
+      [wal-id (->Memtable store wal-chan (atom size) seq-counter)])))
 
 (defn entry-set
-  "The memtable's [k data] entries in key order (an immutable snapshot)."
+  "The memtable's [ikey data] entries in InternalKey order (an immutable snapshot)."
   [^Memtable memtable]
-  (mapv (fn [[k data]] [k data]) @(:store (:mem memtable))))
+  (mapv (fn [[ikey data]] [ikey data]) @(:store (:mem memtable))))

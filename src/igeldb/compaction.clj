@@ -138,9 +138,11 @@
 ;; ---- merge + output ------------------------------------------------------
 
 (defn- read-all-pairs
-  "Read every [k data] entry from an SSTable file (compaction reads whole tables)."
+  "Read every [ikey data] entry from an SSTable file (compaction reads whole
+  tables)."
   [path]
   (with-open [in (java-io/input-stream path)]
+    (io/read-format-byte! in path)
     (loop [acc (transient [])]
       (let [entry (io/read-kv-pair! in)]
         (cond
@@ -151,32 +153,43 @@
           :else (recur (conj! acc entry)))))))
 
 (defn merge-inputs
-  "Merge input file paths given LOW->HIGH precedence into a key-sorted seq of
-  [k data], newest-wins. Drops tombstones when `drop-tombstones?`."
+  "Merge input file paths given LOW->HIGH precedence into a user_key-sorted seq of
+  [ikey data]. Step 1 collapses to the single newest version (max seq) per
+  user_key; Step 6 will keep multiple versions per the MVCC GC floor. Drops
+  tombstones only at the bottom-most level (`drop-tombstones?`)."
   [paths-low-to-high drop-tombstones?]
-  (let [merged (reduce (fn [m path]
-                         (reduce (fn [m [k data]] (assoc m k data))
-                                 m (read-all-pairs path)))
-                       (sorted-map-by (data/byte-array-comparator))
-                       paths-low-to-high)]
-    (keep (fn [[k data]]
+  (let [by-user (reduce
+                 (fn [m path]
+                   (reduce (fn [m [ikey data]]
+                             (let [uk (:user-key ikey)
+                                   cur (get m uk)]
+                               (if (or (nil? cur)
+                                       (> (:seq ikey) (:seq (first cur))))
+                                 (assoc m uk [ikey data])
+                                 m)))
+                           m (read-all-pairs path)))
+                 (sorted-map-by (data/byte-array-comparator))
+                 paths-low-to-high)]
+    (keep (fn [[_uk [ikey data]]]
             (when-not (and drop-tombstones? (:deleted? data))
-              [k data]))
-          merged)))
+              [ikey data]))
+          by-user)))
 
 (defn- entry-bytes
-  [^bytes k data]
-  (+ SEG_OVERHEAD (count k)
-     (if (:deleted? data) 8 (+ SEG_OVERHEAD (count (:value data))))))
+  [ikey data]
+  (+ SEG_OVERHEAD Long/BYTES (count ^bytes (:user-key ikey))
+     (if (:deleted? data) 8 (+ SEG_OVERHEAD (count ^bytes (:value data))))))
 
 (defn- start-table!
   [sstable-id {:keys [sstable-dir bloom-filter]}]
   (let [id (sstable/next-id! sstable-id)
         path (sstable/get-sstable-path id sstable-dir)
-        file-stream (FileOutputStream. path)]
+        file-stream (FileOutputStream. path)
+        out-stream (BufferedOutputStream. file-stream 16384)]
+    (io/write-format-byte! out-stream)
     {:id id :path path
      :file-stream file-stream
-     :out-stream (BufferedOutputStream. file-stream 16384)
+     :out-stream out-stream
      :bloom (blossom/make-filter bloom-filter)
      :head nil :tail nil :bytes 0}))
 
@@ -191,22 +204,23 @@
    :bloom-filter (:bloom t) :size (.length (File. ^String (:path t)))})
 
 (defn- write-output!
-  "Write the merged [k data] seq into non-overlapping output SSTables of about
+  "Write the merged [ikey data] seq into non-overlapping output SSTables of about
   `sstable-target-size` bytes at `out-level`, allocating fresh ids. Returns the
-  vector of edit entries for the new tables."
+  vector of edit entries for the new tables (head/tail are user_keys)."
   [merged out-level sstable-id {:keys [sstable-target-size] :as config}]
   (loop [entries merged
          cur nil
          out []]
     (if (empty? entries)
       (if cur (conj out (finish-table! cur out-level)) out)
-      (let [[k data] (first entries)
+      (let [[ikey data] (first entries)
+            uk (:user-key ikey)
             cur (or cur (start-table! sstable-id config))
-            _ (sstable/write-entry! (:out-stream cur) (:bloom cur) k data)
+            _ (sstable/write-entry! (:out-stream cur) (:bloom cur) ikey data)
             cur (-> cur
-                    (update :head #(or % k))
-                    (assoc :tail k)
-                    (update :bytes + (entry-bytes k data)))]
+                    (update :head #(or % uk))
+                    (assoc :tail uk)
+                    (update :bytes + (entry-bytes ikey data)))]
         (if (>= (:bytes cur) sstable-target-size)
           (recur (rest entries) nil (conj out (finish-table! cur out-level)))
           (recur (rest entries) cur out))))))

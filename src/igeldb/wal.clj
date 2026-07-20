@@ -75,10 +75,11 @@
         [(wal-file-id newest) (replay-wal newest)]))))
 
 (defn entry-size
-  "Byte size an entry contributes to the memtable: the key plus, for a live
-  value, the value bytes. A tombstone contributes only the key."
-  [^bytes k data]
-  (+ (count k) (if (:deleted? data) 0 (count (:value data)))))
+  "Byte size an entry contributes to the memtable heuristic: the user_key plus,
+  for a live value, the value bytes (seq is not counted)."
+  [ikey data]
+  (+ (count ^bytes (:user-key ikey))
+     (if (:deleted? data) 0 (count ^bytes (:value data)))))
 
 (defn- commit-batch!
   "fsync the WAL, then apply the batch to the memtable and release each waiting
@@ -110,8 +111,8 @@
       (doseq [[_ _ comp-chan] batch]
         (async/>!! comp-chan :error))
       (throw e)))
-  (store/write-batch! memstore (mapv (fn [[k data _]] [k data]) batch))
-  (swap! size + (transduce (map (fn [[k data _]] (entry-size k data))) + 0 batch))
+  (store/write-batch! memstore (mapv (fn [[ikey data _]] [ikey data]) batch))
+  (swap! size + (transduce (map (fn [[ikey data _]] (entry-size ikey data))) + 0 batch))
   (doseq [[_ _ comp-chan] batch]
     (async/>!! comp-chan :done)))
 
@@ -154,10 +155,10 @@
                   ;; `next` is [next-batch next-window-chan] to keep going, or
                   ;; nil once the data channel is closed (a flush was requested).
                 (let [next (async/alt!
-                             data-chan ([[k d comp-chan]]
-                                        (when-not (nil? k)
-                                          (io/append-wal! out-stream [k d])
-                                          (let [batch (conj batch [k d comp-chan])]
+                             data-chan ([[ikey d comp-chan]]
+                                        (when-not (nil? ikey)
+                                          (io/append-entry! out-stream [ikey d])
+                                          (let [batch (conj batch [ikey d comp-chan])]
                                             (if (>= (count batch) batch-limit)
                                               (do
                                                 (commit-batch! out-stream file-stream

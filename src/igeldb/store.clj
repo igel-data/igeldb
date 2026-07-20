@@ -1,12 +1,14 @@
 (ns igeldb.store)
 
 (defprotocol IStoreRead
-  "Interface for reading from the data store"
+  "Interface for reading from the data store, at a given `snapshot-seq` (the
+  newest version of each user_key with seq <= snapshot-seq). Non-tx reads pass
+  `Long/MAX_VALUE` (latest)."
   ;; select could return three value types; the valid data, the deleted data,
   ;; and nil.
   ;; The deleted data is a tombstone, and nil means that the key doesn't exist.
-  (select [this ^bytes k])
-  (scan [this ^bytes from-key ^bytes to-key]))
+  (select [this ^bytes k snapshot-seq])
+  (scan [this ^bytes from-key ^bytes to-key snapshot-seq]))
 
 (defprotocol IStoreMutate
   "Interface for mutations to the data store"

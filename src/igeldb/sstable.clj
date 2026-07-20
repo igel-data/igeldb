@@ -31,14 +31,12 @@
   (dec (long (swap! sstable-id inc))))
 
 (defn write-entry!
-  "Write one key/data entry (value or tombstone) to an SSTable output stream and
-  record the key in the bloom filter. Shared by flush and compaction."
-  [out-stream bf ^bytes k data]
-  (io/write-bytes! out-stream k)
-  (if (:deleted? data)
-    (io/write-tombstone! out-stream)
-    (io/write-bytes! out-stream (:value data)))
-  (blossom/add bf k))
+  "Write one InternalKey entry (value or tombstone) to an SSTable output stream
+  and record its user_key in the bloom filter. Shared by flush and compaction.
+  The bloom filter is keyed by user_key (point lookups are per user_key)."
+  [out-stream bf ikey data]
+  (io/append-entry! out-stream [ikey data])
+  (blossom/add bf (:user-key ikey)))
 
 ;; SSTable metadata is managed as `[table-id info]`, where `info` is a map
 ;; `{:head-key :tail-key :bloom-filter :size}` (the bloom filter is a live
@@ -82,21 +80,22 @@
 (defrecord TreeStore [dir current-version rw-lock manifest]
   store/IStoreRead
   (select
-    [this k]
+    [this k snapshot-seq]
     (with-version
       this
       (fn [version]
+        ;; select-order is shallowest (newest) first; a shallower table holds the
+        ;; newest versions, so the first table whose newest version <= snapshot is
+        ;; the answer. `read-value` returns nil for a table whose only versions of
+        ;; k are all > snapshot, so the search continues to deeper (older) levels.
         (loop [tables (select-order version)]
-          ;; Stop once the tables are exhausted: return nil without touching the
-          ;; disk. Only read a value when the Bloom filter reports a hit, so a
-          ;; negative filter never triggers a file read.
           (when-let [[id table] (first tables)]
             (if-let [v (and (blossom/hit? (:bloom-filter table) k)
-                            (io/read-value (get-sstable-path id dir) k))]
+                            (io/read-value (get-sstable-path id dir) k snapshot-seq))]
               v
               (recur (next tables))))))))
   (scan
-    [this from-key to-key]
+    [this from-key to-key snapshot-seq]
     (with-version
       this
       (fn [version]
@@ -111,11 +110,13 @@
               (recur
                (if (and (data/byte-array-smaller? head-key to-key)
                         (data/byte-array-smaller-or-equal? from-key tail-key))
-                 ;; last assoc wins, mirroring TreeMap `.put` -- scan-order feeds
-                 ;; tables lowest-precedence first, so the newest value survives
+                 ;; last assoc wins, keyed by user_key -- scan-order feeds tables
+                 ;; deepest (oldest) first, so the shallowest (newest visible)
+                 ;; version survives; each `scan-pairs` already picks per user_key
+                 ;; the newest version <= snapshot within its file
                  (reduce (fn [m [k d]] (assoc m k d))
                          pairs
-                         (io/scan-pairs sstable-path from-key to-key))
+                         (io/scan-pairs sstable-path from-key to-key snapshot-seq))
                  pairs)
                (rest tables)))))))))
 

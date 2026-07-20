@@ -163,15 +163,18 @@
 (defrecord KVS [config memtable tree coordinator]
   store/IStoreRead
   (select
-    [_ k]
+    [_ k snapshot-seq]
     (reject-if-closed! coordinator :select)
-    (let [data (or (store/select @memtable k) (store/select tree k))]
+    ;; memtable (newest data) wins over the tree; each returns the newest version
+    ;; of k with seq <= snapshot-seq
+    (let [data (or (store/select @memtable k snapshot-seq)
+                   (store/select tree k snapshot-seq))]
       (when (data/is-valid? data) (:value data))))
   (scan
-    [_ from-key to-key]
+    [_ from-key to-key snapshot-seq]
     (reject-if-closed! coordinator :scan)
-    (->> (merge-scan-results (store/scan @memtable from-key to-key)
-                             (store/scan tree from-key to-key))
+    (->> (merge-scan-results (store/scan @memtable from-key to-key snapshot-seq)
+                             (store/scan tree from-key to-key snapshot-seq))
          (filter (fn [[_ data]] (data/is-valid? data)))
          (map (fn [[k data]] [k (:value data)]))))
 
@@ -211,7 +214,10 @@
   [config-path]
   (let [config (config/load-config config-path)
         [tree sstable-id] (restore-tree-store config)
-        [wal-id memtable-val] (init-memtable (async/chan) config)
+        ;; global commit-order sequence counter (shared across memtable
+        ;; generations); init-memtable seeds it from the replayed WAL's max seq
+        seq-counter (atom 0)
+        [wal-id memtable-val] (init-memtable (async/chan) seq-counter config)
         memtable (atom memtable-val)
         coordinator (spawn-bg-workers memtable tree (atom sstable-id)
                                       (atom wal-id) config)]
@@ -225,7 +231,7 @@
   "Read the value corresponding to the given key.
   If the key doesn't exist, it returns nil."
   [^KVS kvs ^bytes k]
-  (store/select kvs k))
+  (store/select kvs k Long/MAX_VALUE))
 
 (defn scan
   "Read the key-value pairs between the `from-key` and the `to-key`.
@@ -233,7 +239,7 @@
   It returns key-value pair vectors like [[k0 v0] [k1 v1]].
   The keys should be ordered by ascending."
   [^KVS kvs ^bytes from-key ^bytes to-key]
-  (store/scan kvs from-key to-key))
+  (store/scan kvs from-key to-key Long/MAX_VALUE))
 
 (defn write!
   "Write the new value correponding to the given key."

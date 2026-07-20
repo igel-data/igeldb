@@ -16,6 +16,31 @@
   [bytes]
   (.getLong (ByteBuffer/wrap bytes)))
 
+;; ---- InternalKey encoding (format v2) ------------------------------------
+;;
+;; An entry's key segment is `seq(8) ++ user_key` (still one length+CRC-framed
+;; segment). The value segment is unchanged (bytes, or length 0 = tombstone). The
+;; put/delete "type" therefore rides in the value (length-0 tombstone), and seq is
+;; carried in the key segment. SSTable files start with a one-byte format version.
+
+(def ^:const SSTABLE_FORMAT_VERSION 2)
+
+(defn encode-ikey
+  ^bytes [ikey]
+  (let [uk ^bytes (:user-key ikey)
+        buf (ByteBuffer/allocate (+ Long/BYTES (count uk)))]
+    (.putLong buf (:seq ikey))
+    (.put buf uk)
+    (.array buf)))
+
+(defn decode-ikey
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)
+        s (.getLong buf)
+        uk (make-array Byte/TYPE (.remaining buf))]
+    (.get buf ^bytes uk)
+    (data/->ikey uk s)))
+
 (defn- calc-crc32 [data]
   (let [crc32 (CRC32.)]
     (.update crc32 data)
@@ -60,9 +85,16 @@
   [^BufferedOutputStream out-stream]
   (.write out-stream (serialize-long 0)))
 
-(defn append-wal!
-  [^BufferedOutputStream out-stream [^bytes k ^data/Data data]]
-  (write-bytes! out-stream k)
+(defn write-format-byte!
+  "Write the one-byte SSTable format version at the start of a file."
+  [^BufferedOutputStream out-stream]
+  (.write out-stream (int SSTABLE_FORMAT_VERSION)))
+
+(defn append-entry!
+  "Write one entry: key segment (`seq ++ user_key`) then value segment (or a
+  length-0 tombstone). Used by both the WAL and SSTable writers."
+  [^BufferedOutputStream out-stream [ikey ^data/Data data]]
+  (write-bytes! out-stream (encode-ikey ikey))
   (if (:deleted? data)
     (write-tombstone! out-stream)
     (write-bytes! out-stream (:value data))))
@@ -111,18 +143,18 @@
                       {:file (str file-path) :reason r})))))
 
 (defn read-kv-pair!
-  "Read one key-value entry (key segment then value segment). Returns:
-    :eof        - a clean end at a record boundary
-    :truncated  - an incomplete entry at the tail
-    :corrupt    - a CRC mismatch (mid-file corruption)
-    [k data]    - a complete entry; `data` is a `data/Data` (value or tombstone)"
+  "Read one entry (key segment then value segment). Returns:
+    :eof         - a clean end at a record boundary
+    :truncated   - an incomplete entry at the tail
+    :corrupt     - a CRC mismatch (mid-file corruption)
+    [ikey data]  - a complete entry; `ikey` is an InternalKey, `data` a `Data`"
   [^BufferedInputStream in-stream]
   (let [k (read-data! in-stream)]
     (if (map? k)
       (let [v (read-data! in-stream)]
         (cond
-          (map? v) [(:ok k) (data/new-data (:ok v))]
-          (= :tombstone v) [(:ok k) (data/deleted-data)]
+          (map? v) [(decode-ikey (:ok k)) (data/new-data (:ok v))]
+          (= :tombstone v) [(decode-ikey (:ok k)) (data/deleted-data)]
           (= :corrupt v) :corrupt
           ;; :eof or :truncated after a key = an incomplete entry
           :else :truncated))
@@ -134,9 +166,21 @@
         :truncated :truncated
         :corrupt))))
 
+(defn read-format-byte!
+  "Consume and validate the leading SSTable format-version byte."
+  [^BufferedInputStream in-stream file-path]
+  (let [b (.read in-stream)]
+    (when-not (= b SSTABLE_FORMAT_VERSION)
+      (throw (ex-info "Unsupported or corrupt SSTable format"
+                      {:file (str file-path) :format-byte b})))))
+
 (defn read-value
-  [file-path target-key]
+  "Point read: the newest version of `target-key` (a user_key) with seq <=
+  `snapshot-seq`, or nil. Entries are user_key-asc / seq-desc, so the first entry
+  with user_key == target and seq <= snapshot is the answer."
+  [file-path target-key snapshot-seq]
   (with-open [in-stream (io/input-stream file-path)]
+    (read-format-byte! in-stream file-path)
     (loop []
       (let [entry (read-kv-pair! in-stream)]
         (case entry
@@ -145,25 +189,34 @@
           (:truncated :corrupt)
           (throw (ex-info "SSTable is corrupted"
                           {:file (str file-path) :reason entry}))
-          (let [[k data] entry]
-            (if (data/byte-array-equals? k target-key)
-              data
-              (recur))))))))
+          (let [[ikey data] entry
+                cmp (.compare (data/byte-array-comparator) (:user-key ikey) target-key)]
+            (cond
+              (neg? cmp) (recur)                       ;; before the target user_key
+              (pos? cmp) nil                           ;; past it -> not present
+              (<= (:seq ikey) snapshot-seq) data       ;; newest visible version
+              :else (recur))))))))                     ;; version too new; try older
 
 (defn scan-pairs
-  [file-path from-key to-key]
+  "Range read: for each user_key in [from-key, to-key), its newest version with
+  seq <= `snapshot-seq`, as [user_key data] (tombstones included; callers filter).
+  Entries are user_key-asc / seq-desc."
+  [file-path from-key to-key snapshot-seq]
   (with-open [in-stream (io/input-stream file-path)]
-    (loop [pairs (transient [])]
+    (read-format-byte! in-stream file-path)
+    (loop [pairs (transient [])
+           emitted nil]
       (let [entry (read-kv-pair! in-stream)]
         (case entry
           :eof (persistent! pairs)
           (:truncated :corrupt)
           (throw (ex-info "SSTable is corrupted"
                           {:file (str file-path) :reason entry}))
-          (let [[k data] entry]
-            (if (data/byte-array-smaller-or-equal? to-key k)
-              (persistent! pairs)
-              (recur
-               (if (data/byte-array-smaller-or-equal? from-key k)
-                 (conj! pairs [k data])
-                 pairs)))))))))
+          (let [[ikey data] entry
+                uk (:user-key ikey)]
+            (cond
+              (data/byte-array-smaller? uk from-key) (recur pairs emitted)
+              (data/byte-array-smaller-or-equal? to-key uk) (persistent! pairs)
+              (and emitted (data/byte-array-equals? uk emitted)) (recur pairs emitted)
+              (> (:seq ikey) snapshot-seq) (recur pairs emitted)
+              :else (recur (conj! pairs [uk data]) uk))))))))

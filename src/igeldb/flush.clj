@@ -10,7 +10,9 @@
 
 (defn- switch-memtable!
   [memtable wal-chan]
-  (let [[old _] (reset-vals! memtable (memtable/create-memtable wal-chan))]
+  ;; the new memtable shares the global seq counter with the old one
+  (let [seq-counter (:seq-counter @memtable)
+        [old _] (reset-vals! memtable (memtable/create-memtable wal-chan seq-counter))]
     old))
 
 (defn- flush-memtable!
@@ -21,13 +23,15 @@
   (let [sstable-path (sstable/get-sstable-path new-id sstable-dir)
         bf (blossom/make-filter bloom-filter)
         entry-set (memtable/entry-set memtable)
-        head-key (-> entry-set first first)
-        tail-key (-> entry-set last first)]
+        ;; entries are [ikey data] in InternalKey order; head/tail are user_keys
+        head-key (:user-key (first (first entry-set)))
+        tail-key (:user-key (first (last entry-set)))]
     (logging/info "Starting flush to SSTable" sstable-path)
     (with-open [file-stream (FileOutputStream. sstable-path)
                 out-stream (BufferedOutputStream. file-stream 16384)]
-      (doseq [[k data] entry-set]
-        (sstable/write-entry! out-stream bf k data))
+      (io/write-format-byte! out-stream)
+      (doseq [[ikey data] entry-set]
+        (sstable/write-entry! out-stream bf ikey data))
       (.flush out-stream)
       (-> file-stream .getChannel (.force true)))
     {:id new-id :level 0 :head-key head-key :tail-key tail-key

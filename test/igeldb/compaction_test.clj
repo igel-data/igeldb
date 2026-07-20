@@ -67,30 +67,33 @@
 ;; ---- unit: merge precedence + tombstone handling -------------------------
 
 (defn- write-sst!
-  "Write [k-str v-str-or-nil] entries as a raw SSTable (nil value = tombstone)."
-  [path entries]
+  "Write [k-str v-str-or-nil] entries as a raw SSTable at commit `seq` (nil value
+  = tombstone). Entries must be given in user_key order."
+  [path seq entries]
   (with-open [fs (FileOutputStream. path)
               os (BufferedOutputStream. fs)]
+    (io/write-format-byte! os)
     (doseq [[k v] entries]
-      (io/write-bytes! os (->bytes k))
-      (if v (io/write-bytes! os (->bytes v)) (io/write-tombstone! os)))
+      (io/append-entry! os [(data/->ikey (->bytes k) seq)
+                            (if v (data/new-data (->bytes v)) (data/deleted-data))]))
     (.flush os)
     (-> fs .getChannel (.force true))))
 
 (deftest merge-newest-wins-and-tombstone-at-bottom-test
   (let [dir "./test-data/compaction-merge"]
     (.mkdirs (jio/file dir))
-    (let [older (str dir "/older.sst")   ;; lower precedence
-          newer (str dir "/newer.sst")]  ;; higher precedence
-      (write-sst! older [["alive" "y"] ["gone" "x"]])
-      (write-sst! newer [["gone" nil]]) ;; newer tombstone shadows gone=x
+    (let [older (str dir "/older.sst")
+          newer (str dir "/newer.sst")]
+      (write-sst! older 5 [["alive" "y"] ["gone" "x"]])
+      (write-sst! newer 10 [["gone" nil]]) ;; newer (higher seq) tombstone wins
       (testing "bottom level: the tombstone (and the value it shadows) are dropped"
         (let [merged (vec (compaction/merge-inputs [older newer] true))]
-          (is (= ["alive"] (mapv (comp #(String. %) first) merged))
+          (is (= ["alive"] (mapv (comp #(String. %) :user-key first) merged))
               "only the live key survives")))
       (testing "non-bottom level: the tombstone is preserved to shadow deeper data"
         (let [merged (compaction/merge-inputs [older newer] false)
-              m (into {} (map (fn [[k d]] [(String. k) (:deleted? d)]) merged))]
+              m (into {} (map (fn [[ikey d]] [(String. (:user-key ikey)) (:deleted? d)])
+                              merged))]
           (is (= {"alive" false "gone" true} m)))))
     (rm-rf dir)))
 
