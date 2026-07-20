@@ -19,10 +19,10 @@
   `memtable` atom, so reading it then resetting it is race-free here."
   [memtable immutable-memtable wal-chan]
   (let [old @memtable
-        ;; the new memtable shares the global seq counter with the old one
-        seq-counter (:seq-counter old)]
+        ;; the new memtable shares the global tx registry with the old one
+        registry (:registry old)]
     (reset! immutable-memtable old)
-    (reset! memtable (memtable/create-memtable wal-chan seq-counter))
+    (reset! memtable (memtable/create-memtable wal-chan registry))
     old))
 
 (defn- flush-memtable!

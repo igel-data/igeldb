@@ -8,6 +8,7 @@
             [igeldb.memtable :refer [init-memtable]]
             [igeldb.sstable :refer [restore-tree-store]]
             [igeldb.store :as store]
+            [igeldb.tx :as tx]
             [igeldb.wal :as wal])
   (:gen-class))
 
@@ -161,7 +162,7 @@
   (when (= :closed @(:poison coordinator))
     (throw (ex-info (str (name op) " rejected: the store is closed") {}))))
 
-(defrecord KVS [config memtable immutable-memtable tree coordinator]
+(defrecord KVS [config memtable immutable-memtable tree registry coordinator]
   store/IStoreRead
   (select
     [_ k snapshot-seq]
@@ -227,10 +228,11 @@
   [config-path]
   (let [config (config/load-config config-path)
         [tree sstable-id] (restore-tree-store config)
-        ;; global commit-order sequence counter (shared across memtable
-        ;; generations); init-memtable seeds it from the replayed WAL's max seq
-        seq-counter (atom 0)
-        [wal-id memtable-val] (init-memtable (async/chan) seq-counter config)
+        ;; global commit-order / MVCC state (shared across memtable generations):
+        ;; the seq counter + the active-tx snapshot set. init-memtable seeds the
+        ;; counter from the replayed WAL's max seq.
+        registry (tx/create-registry)
+        [wal-id memtable-val] (init-memtable (async/chan) registry config)
         memtable (atom memtable-val)
         ;; Holds the memtable currently being flushed (nil when no flush is in
         ;; progress). Reads consult it between the mutable memtable and the
@@ -242,7 +244,7 @@
     ;; (and, on restart, committed the replayed WAL to an SSTable).
     (when-not (true? (deref (:ready coordinator) INIT_TIMEOUT_MS :timeout))
       (throw (ex-info "Initializing KVS failed" {} @(:poison coordinator))))
-    (->KVS config memtable immutable-memtable tree coordinator)))
+    (->KVS config memtable immutable-memtable tree registry coordinator)))
 
 (defn select
   "Read the value corresponding to the given key.

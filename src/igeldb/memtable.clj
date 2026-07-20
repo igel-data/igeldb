@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async]
             [igeldb.data :as data]
             [igeldb.store :as store]
+            [igeldb.tx :as tx]
             [igeldb.wal :as wal]))
 
 ;; The memtable store is an atom holding an *immutable* sorted map keyed by
@@ -61,7 +62,7 @@
     (swap! store (fn [m] (reduce (fn [m [ikey d]] (assoc m ikey d)) m entries))))
   (delete! [_ _] (throw (UnsupportedOperationException.))))
 
-(defrecord Memtable [mem wal-chan size seq-counter]
+(defrecord Memtable [mem wal-chan size registry]
   store/IStoreRead
   ;; Reads are lock-free over an immutable snapshot behind an atom.
   (select
@@ -80,7 +81,7 @@
   ;; seq assignment into the commit-handler.)
   (write!
     [_ k v]
-    (let [ikey (data/->ikey k (swap! seq-counter inc))
+    (let [ikey (data/->ikey k (tx/next-seq! registry))
           comp-chan (async/chan)]
       (when-not (async/>!! wal-chan [ikey (data/new-data v) comp-chan])
         (throw (ex-info "Write failed due to memtable switching"
@@ -94,7 +95,7 @@
   (write-batch! [_ _] (throw (UnsupportedOperationException.)))
   (delete!
     [_ k]
-    (let [ikey (data/->ikey k (swap! seq-counter inc))
+    (let [ikey (data/->ikey k (tx/next-seq! registry))
           comp-chan (async/chan)]
       (when-not (async/>!! wal-chan [ikey (data/deleted-data) comp-chan])
         (throw (ex-info "Delete failed due to memtable switching"
@@ -109,25 +110,25 @@
   (->MemStore (atom (sorted-map-by (data/internal-key-comparator)))))
 
 (defn create-memtable
-  "Create a new (empty) memtable sharing the global `seq-counter`."
-  [wal-chan seq-counter]
-  (->Memtable (empty-store) wal-chan (atom 0) seq-counter))
+  "Create a new (empty) memtable sharing the global tx `registry`."
+  [wal-chan registry]
+  (->Memtable (empty-store) wal-chan (atom 0) registry))
 
 (defn init-memtable
   "Initialize the memtable, restoring data from the WAL. Returns `[wal-id
-  memtable]`. Seeds the shared `seq-counter` to the max replayed seq so new writes
-  get higher seqs (Step 7 also folds in the manifest max-seq). The `size` is the
-  actual byte size of the replayed entries."
-  [wal-chan seq-counter config]
+  memtable]`. Seeds the shared `registry`'s commit-order counter to the max
+  replayed seq so new writes get higher seqs (Step 7 also folds in the manifest
+  max-seq). The `size` is the actual byte size of the replayed entries."
+  [wal-chan registry config]
   (let [store (empty-store)
         [wal-id wal-pairs] (wal/load-existing-wal config)]
     ;; `load-existing-wal` returns [ikey data] entries; apply them in WAL order so
     ;; the replayed memtable matches the pre-crash state.
     (store/write-batch! store wal-pairs)
-    (reset! seq-counter (reduce (fn [m [ikey _]] (max m (:seq ikey))) 0 wal-pairs))
+    (tx/seed-seq! registry (reduce (fn [m [ikey _]] (max m (:seq ikey))) 0 wal-pairs))
     (let [size (reduce (fn [acc [ikey data]] (+ acc (wal/entry-size ikey data)))
                        0 wal-pairs)]
-      [wal-id (->Memtable store wal-chan (atom size) seq-counter)])))
+      [wal-id (->Memtable store wal-chan (atom size) registry)])))
 
 (defn entry-set
   "The memtable's [ikey data] entries in InternalKey order (an immutable snapshot)."
