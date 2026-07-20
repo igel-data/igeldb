@@ -9,10 +9,20 @@
   (:import (java.io FileOutputStream BufferedOutputStream File)))
 
 (defn- switch-memtable!
-  [memtable wal-chan]
-  ;; the new memtable shares the global seq counter with the old one
-  (let [seq-counter (:seq-counter @memtable)
-        [old _] (reset-vals! memtable (memtable/create-memtable wal-chan seq-counter))]
+  "Swap in a fresh empty memtable and return the old one (to be flushed). Publish
+  the memtable about to be flushed as the *immutable memtable* BEFORE the swap, so
+  a concurrent reader never sees a gap where the switched-out data lives in
+  neither `@memtable` nor a committed version. Reads consult
+  mutable -> immutable -> version; at this instant the immutable memtable IS the
+  current mutable one, so nothing is missed. `flush!` clears the reference once
+  the flush is committed to a version. Only the flush thread swaps the outer
+  `memtable` atom, so reading it then resetting it is race-free here."
+  [memtable immutable-memtable wal-chan]
+  (let [old @memtable
+        ;; the new memtable shares the global seq counter with the old one
+        seq-counter (:seq-counter old)]
+    (reset! immutable-memtable old)
+    (reset! memtable (memtable/create-memtable wal-chan seq-counter))
     old))
 
 (defn- flush-memtable!
@@ -43,7 +53,7 @@
 
   Runs on a real thread (see `spawn-flush-writer`), so the blocking `>!!` and
   file IO here are intentional and do not occupy a core.async pool thread."
-  [memtable tree sstable-id wal-id flush-wal-chan config]
+  [memtable immutable-memtable tree sstable-id wal-id flush-wal-chan config]
   (if (zero? (-> @memtable :size deref))
     ;; Nothing to flush: hand the current (unchanged) WAL generation to the
     ;; worker. Only reached for the very first flush of an empty store.
@@ -51,7 +61,7 @@
     (let [new-id (sstable/next-id! sstable-id)
           old-wal-id @wal-id
           new-wal-chan (async/chan)
-          entry (-> (switch-memtable! memtable new-wal-chan)
+          entry (-> (switch-memtable! memtable immutable-memtable new-wal-chan)
                     (flush-memtable! new-id config))]
       ;; Ordering is crash-safety-critical:
       ;;   write+fsync SSTable (done above)
@@ -64,6 +74,11 @@
       ;; discards the old WAL, whose data lives only in the un-committed (orphan,
       ;; therefore ignored) SSTable -> data loss.
       (sstable/commit-edit! tree {:added [entry] :deleted []})
+      ;; The flushed data now lives in a committed version; drop the immutable
+      ;; memtable reference. Reads fall through mutable -> version with no gap:
+      ;; before this reset the data is in both the immutable memtable and the
+      ;; version (consistent), after it it is in the version only.
+      (reset! immutable-memtable nil)
       ;; Hand the new WAL generation to the worker. `switch-memtable!` has
       ;; already installed the new (empty) memtable as `@memtable`; the worker
       ;; reads its wal-chan, memstore and size from it. The new WAL ID is the
@@ -81,15 +96,16 @@
   and blocking channel hand-offs, which belong on a thread rather than a
   core.async go pool. `ready` is delivered once the initial flush has set up the
   first WAL generation (true on success, false if the store was poisoned)."
-  [memtable tree sstable-id wal-id poison ready req-chan flush-wal-chan
-   compaction-req-chan config]
+  [memtable immutable-memtable tree sstable-id wal-id poison ready req-chan
+   flush-wal-chan compaction-req-chan config]
   (letfn [(safe-flush! []
             ;; Fail-stop (3-3): a flush failure poisons the store just like an
             ;; fsync failure. If the loop died silently instead, nothing would
             ;; ever flush again and the memtable would grow unbounded.
             ;; Returns true on success, false once poisoned.
             (try
-              (flush! memtable tree sstable-id wal-id flush-wal-chan config)
+              (flush! memtable immutable-memtable tree sstable-id wal-id
+                      flush-wal-chan config)
               true
               (catch Throwable e
                 (reset! poison e)

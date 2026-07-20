@@ -26,7 +26,7 @@
                         stall-monitor])
 
 (defn spawn-bg-workers
-  [memtable tree sstable-id wal-id config]
+  [memtable immutable-memtable tree sstable-id wal-id config]
   (let [flush-req-chan (async/chan)
         flush-wal-chan (async/chan)
         ;; sliding-buffer so a flush never blocks signaling and signals coalesce
@@ -44,8 +44,9 @@
                    (locking stall-monitor (.notifyAll stall-monitor)))))
     ;; Spawn the workers for their side effects; their return channels are
     ;; unused (see the Coordinator note above).
-    (f/spawn-flush-writer memtable tree sstable-id wal-id poison ready
-                          flush-req-chan flush-wal-chan compaction-req-chan config)
+    (f/spawn-flush-writer memtable immutable-memtable tree sstable-id wal-id
+                          poison ready flush-req-chan flush-wal-chan
+                          compaction-req-chan config)
     (wal/spawn-wal-writer poison flush-req-chan flush-wal-chan config)
     (compaction/spawn-compaction-worker tree sstable-id compact-pointers poison
                                         stall-monitor compaction-req-chan config)
@@ -160,23 +161,35 @@
   (when (= :closed @(:poison coordinator))
     (throw (ex-info (str (name op) " rejected: the store is closed") {}))))
 
-(defrecord KVS [config memtable tree coordinator]
+(defrecord KVS [config memtable immutable-memtable tree coordinator]
   store/IStoreRead
   (select
     [_ k snapshot-seq]
     (reject-if-closed! coordinator :select)
-    ;; memtable (newest data) wins over the tree; each returns the newest version
-    ;; of k with seq <= snapshot-seq
-    (let [data (or (store/select @memtable k snapshot-seq)
+    ;; Read precedence: mutable memtable -> immutable memtable (the one being
+    ;; flushed, if a flush is in progress) -> version. Each returns the newest
+    ;; version of k with seq <= snapshot-seq. The immutable-memtable consult
+    ;; closes the flush-visibility gap: while `switch-memtable!` has installed a
+    ;; fresh memtable but the flush is not yet committed to a version, the
+    ;; switched-out data is still visible here.
+    (let [imm @immutable-memtable
+          data (or (store/select @memtable k snapshot-seq)
+                   (when imm (store/select imm k snapshot-seq))
                    (store/select tree k snapshot-seq))]
       (when (data/is-valid? data) (:value data))))
   (scan
     [_ from-key to-key snapshot-seq]
     (reject-if-closed! coordinator :scan)
-    (->> (merge-scan-results (store/scan @memtable from-key to-key snapshot-seq)
-                             (store/scan tree from-key to-key snapshot-seq))
-         (filter (fn [[_ data]] (data/is-valid? data)))
-         (map (fn [[k data]] [k (:value data)]))))
+    (let [imm @immutable-memtable
+          mem-ret (store/scan @memtable from-key to-key snapshot-seq)
+          imm-ret (when imm (store/scan imm from-key to-key snapshot-seq))
+          tree-ret (store/scan tree from-key to-key snapshot-seq)]
+      ;; Merge in descending precedence: mutable > immutable > version. Each
+      ;; merge keeps the first argument's value on equal user_keys, so chaining
+      ;; preserves that precedence.
+      (->> (merge-scan-results (merge-scan-results mem-ret imm-ret) tree-ret)
+           (filter (fn [[_ data]] (data/is-valid? data)))
+           (map (fn [[k data]] [k (:value data)])))))
 
   store/IStoreMutate
   (write!
@@ -219,13 +232,17 @@
         seq-counter (atom 0)
         [wal-id memtable-val] (init-memtable (async/chan) seq-counter config)
         memtable (atom memtable-val)
-        coordinator (spawn-bg-workers memtable tree (atom sstable-id)
-                                      (atom wal-id) config)]
+        ;; Holds the memtable currently being flushed (nil when no flush is in
+        ;; progress). Reads consult it between the mutable memtable and the
+        ;; version, closing the flush-visibility gap (see KVS/select).
+        immutable-memtable (atom nil)
+        coordinator (spawn-bg-workers memtable immutable-memtable tree
+                                      (atom sstable-id) (atom wal-id) config)]
     ;; Block until the initial flush has established the first WAL generation
     ;; (and, on restart, committed the replayed WAL to an SSTable).
     (when-not (true? (deref (:ready coordinator) INIT_TIMEOUT_MS :timeout))
       (throw (ex-info "Initializing KVS failed" {} @(:poison coordinator))))
-    (->KVS config memtable tree coordinator)))
+    (->KVS config memtable immutable-memtable tree coordinator)))
 
 (defn select
   "Read the value corresponding to the given key.
