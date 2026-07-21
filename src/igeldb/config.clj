@@ -7,6 +7,10 @@
 (def ^:private ^:const DEFAULT_GROUP_COMMIT_LIMIT 64)
 (def ^:private ^:const DEFAULT_WRITE_RETRIES 10)
 (def ^:private ^:const DEFAULT_BLOOM_FILTER {:size 10240})
+;; Target bytes per SSTable index block. A point read binary-searches the sparse
+;; in-memory index to a block, then linear-scans only within it, so this trades
+;; index size against per-read scan work.
+(def ^:private ^:const DEFAULT_SSTABLE_BLOCK_SIZE 4096)
 (def ^:private ^:const DEFAULT_L0_COMPACTION_TRIGGER 4)
 (def ^:private ^:const DEFAULT_L0_STALL_THRESHOLD 16)
 (def ^:private ^:const DEFAULT_LEVEL_SIZE_MULTIPLIER 10)
@@ -25,6 +29,7 @@
                  :group-commit-limit DEFAULT_GROUP_COMMIT_LIMIT
                  :write-retries DEFAULT_WRITE_RETRIES
                  :bloom-filter DEFAULT_BLOOM_FILTER
+                 :sstable-block-size DEFAULT_SSTABLE_BLOCK_SIZE
                  :l0-compaction-trigger DEFAULT_L0_COMPACTION_TRIGGER
                  :l0-stall-threshold DEFAULT_L0_STALL_THRESHOLD
                  :level-size-multiplier DEFAULT_LEVEL_SIZE_MULTIPLIER}
@@ -43,7 +48,8 @@
       (throw (ex-info "Need to set `wal-dir` in the config" config)))
     (doseq [k [:memtable-size :sync-window-time :group-commit-limit
                :l0-compaction-trigger :l0-stall-threshold
-               :level-size-multiplier :l1-base-size :sstable-target-size]]
+               :level-size-multiplier :l1-base-size :sstable-target-size
+               :sstable-block-size]]
       (when-not (pos? (k result))
         (throw (ex-info (str "`" (name k) "` should be positive in the config")
                         result))))

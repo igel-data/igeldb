@@ -1,12 +1,10 @@
 (ns igeldb.flush
-  (:require  [blossom.core :as blossom]
-             [clojure.core.async :as async]
+  (:require  [clojure.core.async :as async]
              [clojure.tools.logging :as logging]
              [igeldb.io :as io]
              [igeldb.memtable :as memtable]
              [igeldb.sstable :as sstable]
-             [igeldb.wal :as wal])
-  (:import (java.io FileOutputStream BufferedOutputStream File)))
+             [igeldb.wal :as wal]))
 
 (defn- switch-memtable!
   "Swap in a fresh empty memtable and return the old one (to be flushed). Publish
@@ -29,27 +27,18 @@
   "Write the memtable out as one L0 SSTable (data + fsync) and return the table
   entry `{:id :level 0 :head-key :tail-key :bloom-filter :size}`. No `.info` file
   -- the manifest is now the sole metadata source (see `sstable/commit-edit!`)."
-  [memtable new-id {:keys [sstable-dir bloom-filter]}]
-  (let [sstable-path (sstable/get-sstable-path new-id sstable-dir)
-        bf (blossom/make-filter bloom-filter)
-        entry-set (memtable/entry-set memtable)
-        ;; entries are [ikey data] in InternalKey order; head/tail are user_keys
-        head-key (:user-key (first (first entry-set)))
-        tail-key (:user-key (first (last entry-set)))
+  [memtable new-id config]
+  (let [entry-set (memtable/entry-set memtable)
         ;; highest seq flushed -- carried into the manifest edit for next-seq
         ;; recovery (a clean shutdown after a flush leaves an empty WAL, so the
         ;; newest seq can live only in SSTables). Ignored by per-table encoding.
-        max-seq (reduce (fn [m [ikey _]] (max m (:seq ikey))) 0 entry-set)]
-    (logging/info "Starting flush to SSTable" sstable-path)
-    (with-open [file-stream (FileOutputStream. sstable-path)
-                out-stream (BufferedOutputStream. file-stream 16384)]
-      (io/write-format-byte! out-stream)
-      (doseq [[ikey data] entry-set]
-        (sstable/write-entry! out-stream bf ikey data))
-      (.flush out-stream)
-      (-> file-stream .getChannel (.force true)))
-    {:id new-id :level 0 :head-key head-key :tail-key tail-key
-     :bloom-filter bf :size (.length (File. sstable-path)) :max-seq max-seq}))
+        max-seq (reduce (fn [m [ikey _]] (max m (:seq ikey))) 0 entry-set)
+        writer (sstable/open-table! new-id config)]
+    (logging/info "Starting flush to SSTable" (:path writer))
+    (doseq [[ikey data] entry-set]
+      (sstable/write-entry! writer ikey data))
+    ;; head/tail keys, bloom, sparse index and size all come from the writer
+    (assoc (sstable/close-table! writer 0) :max-seq max-seq)))
 
 (defn- flush!
   "Commit the current memtable to an SSTable (when it holds data) and rotate the

@@ -5,8 +5,8 @@
             [igeldb.compaction :as compaction]
             [igeldb.core :as igel]
             [igeldb.data :as data]
-            [igeldb.io :as io])
-  (:import (java.io FileOutputStream BufferedOutputStream)))
+            [igeldb.io :as io]
+            [igeldb.sstable :as sstable]))
 
 (defn- ->bytes [^String s] (.getBytes s))
 (defn- b= [a b] (data/byte-array-equals? a b))
@@ -66,31 +66,34 @@
 
 ;; ---- unit: merge precedence + tombstone handling -------------------------
 
+(defn- sst-config
+  [dir & [block-size]]
+  {:sstable-dir dir
+   :bloom-filter {:size 1024}
+   :sstable-block-size (or block-size 4096)})
+
 (defn- write-sst!
-  "Write [k-str v-str-or-nil] entries as a raw SSTable at commit `seq` (nil value
-  = tombstone). Entries must be given in user_key order."
-  [path seq entries]
-  (with-open [fs (FileOutputStream. path)
-              os (BufferedOutputStream. fs)]
-    (io/write-format-byte! os)
+  "Write [k-str v-str-or-nil] entries as an SSTable at commit `seq` (nil value =
+  tombstone), via the production writer so the sparse index + footer are built.
+  Entries must be given in user_key order. Returns the file path."
+  [dir id seq entries]
+  (let [w (sstable/open-table! id (sst-config dir))]
     (doseq [[k v] entries]
-      (io/append-entry! os [(data/->ikey (->bytes k) seq)
-                            (if v (data/new-data (->bytes v)) (data/deleted-data))]))
-    (.flush os)
-    (-> fs .getChannel (.force true))))
+      (sstable/write-entry! w (data/->ikey (->bytes k) seq)
+                            (if v (data/new-data (->bytes v)) (data/deleted-data))))
+    (sstable/close-table! w 0)
+    (sstable/get-sstable-path id dir)))
 
 (defn- write-versions!
-  "Write [k-str seq v-str-or-nil] entries (nil = tombstone) as a raw SSTable with
-  explicit per-entry seqs. Entries should be in user_key-asc / seq-desc order."
-  [path entries]
-  (with-open [fs (FileOutputStream. path)
-              os (BufferedOutputStream. fs)]
-    (io/write-format-byte! os)
+  "As `write-sst!` but with explicit per-entry seqs: [k-str seq v-str-or-nil].
+  Entries should be in user_key-asc / seq-desc order. Returns the file path."
+  [dir id entries & [block-size]]
+  (let [w (sstable/open-table! id (sst-config dir block-size))]
     (doseq [[k seq v] entries]
-      (io/append-entry! os [(data/->ikey (->bytes k) seq)
-                            (if v (data/new-data (->bytes v)) (data/deleted-data))]))
-    (.flush os)
-    (-> fs .getChannel (.force true))))
+      (sstable/write-entry! w (data/->ikey (->bytes k) seq)
+                            (if v (data/new-data (->bytes v)) (data/deleted-data))))
+    (sstable/close-table! w 0)
+    (sstable/get-sstable-path id dir)))
 
 (defn- seqs-of
   "The seqs of the merged entries for user_key `k`, in output order."
@@ -104,9 +107,8 @@
 (deftest gc-keeps-floor-survivor-plus-newer-drops-older-test
   (let [dir "./test-data/compaction-gc-floor"]
     (.mkdirs (jio/file dir))
-    (let [path (str dir "/versions.sst")]
-      ;; key "k" at seqs 9, 6, 3 (all values); an unrelated key "z"
-      (write-versions! path [["k" 9 "v9"] ["k" 6 "v6"] ["k" 3 "v3"] ["z" 5 "vz"]])
+    (let [path (write-versions! dir 0 [["k" 9 "v9"] ["k" 6 "v6"] ["k" 3 "v3"]
+                                       ["z" 5 "vz"]])]
       (testing "floor between versions: keep all > floor plus the newest <= floor"
         (is (= [9 6] (seqs-of (vec (compaction/merge-inputs [path] 6 false)) "k"))
             "seq 9 (> floor) and seq 6 (floor survivor) kept; seq 3 dropped"))
@@ -119,9 +121,8 @@
 (deftest gc-tombstone-dropped-only-at-bottom-level-test
   (let [dir "./test-data/compaction-gc-tombstone"]
     (.mkdirs (jio/file dir))
-    (let [path (str dir "/versions.sst")]
-      ;; key "d": tombstone@8 shadowing value@4; floor high (collapse to newest)
-      (write-versions! path [["d" 8 nil] ["d" 4 "old"]])
+    ;; key "d": tombstone@8 shadowing value@4; floor high (collapse to newest)
+    (let [path (write-versions! dir 0 [["d" 8 nil] ["d" 4 "old"]])]
       (testing "non-bottom level: the surviving tombstone is preserved"
         (let [merged (vec (compaction/merge-inputs [path] 100 false))]
           (is (= [8] (seqs-of merged "d")))
@@ -136,8 +137,8 @@
   ;; survivor may be dropped.
   (let [dir "./test-data/compaction-gc-tombstone-above"]
     (.mkdirs (jio/file dir))
-    (let [path (str dir "/versions.sst")]
-      (write-versions! path [["d" 10 nil] ["d" 3 "old"]]) ;; tombstone@10, value@3
+    ;; tombstone@10, value@3
+    (let [path (write-versions! dir 0 [["d" 10 nil] ["d" 3 "old"]])]
       (let [merged (vec (compaction/merge-inputs [path] 5 true))] ;; floor 5, bottom
         (is (= [10 3] (seqs-of merged "d"))
             "above-floor tombstone kept; value@3 is the floor survivor, kept")
@@ -147,10 +148,9 @@
 (deftest merge-newest-wins-and-tombstone-at-bottom-test
   (let [dir "./test-data/compaction-merge"]
     (.mkdirs (jio/file dir))
-    (let [older (str dir "/older.sst")
-          newer (str dir "/newer.sst")]
-      (write-sst! older 5 [["alive" "y"] ["gone" "x"]])
-      (write-sst! newer 10 [["gone" nil]]) ;; newer (higher seq) tombstone wins
+    (let [older (write-sst! dir 0 5 [["alive" "y"] ["gone" "x"]])
+          ;; newer (higher seq) tombstone wins
+          newer (write-sst! dir 1 10 [["gone" nil]])]
       (testing "bottom level: the tombstone (and the value it shadows) are dropped"
         ;; floor = MAX_VALUE: no live tx, so each key collapses to its newest version
         (let [merged (vec (compaction/merge-inputs [older newer] Long/MAX_VALUE true))]

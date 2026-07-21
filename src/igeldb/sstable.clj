@@ -5,7 +5,7 @@
             [igeldb.io :as io]
             [igeldb.manifest :as manifest]
             [igeldb.store :as store])
-  (:import (java.io File)
+  (:import (java.io File FileOutputStream BufferedOutputStream)
            (java.util.concurrent Semaphore)))
 
 (defn get-sstable-path
@@ -30,13 +30,85 @@
   [sstable-id]
   (dec (long (swap! sstable-id inc))))
 
+;; ---- SSTable writer: entries + sparse block index + footer ----------------
+;;
+;; Shared by flush and compaction. As entries are appended it tracks the byte
+;; offset, the bloom filter (keyed by user_key -- point lookups are per user_key)
+;; and the sparse block index; `close-table!` appends the footer and fsyncs.
+
+(defrecord TableWriter [id path file-stream out-stream bloom block-size state])
+
+(defn open-table!
+  "Open a new SSTable for writing."
+  [id {:keys [sstable-dir bloom-filter sstable-block-size]}]
+  (let [path (get-sstable-path id sstable-dir)
+        file-stream (FileOutputStream. ^String path)
+        out-stream (BufferedOutputStream. file-stream 16384)]
+    (io/write-format-byte! out-stream)
+    (->TableWriter id path file-stream out-stream
+                   (blossom/make-filter bloom-filter)
+                   sstable-block-size
+                   ;; offset starts at 1: the format byte occupies byte 0
+                   (atom {:offset 1 :blocks [] :block-first nil :block-start nil
+                          :block-bytes 0 :last-key nil :head nil :tail nil}))))
+
+(defn table-bytes
+  "Bytes written so far (entries only, excluding the not-yet-written footer)."
+  ^long [writer]
+  (:offset @(:state writer)))
+
 (defn write-entry!
-  "Write one InternalKey entry (value or tombstone) to an SSTable output stream
-  and record its user_key in the bloom filter. Shared by flush and compaction.
-  The bloom filter is keyed by user_key (point lookups are per user_key)."
-  [out-stream bf ikey data]
-  (io/append-entry! out-stream [ikey data])
-  (blossom/add bf (:user-key ikey)))
+  "Append one InternalKey entry (value or tombstone). A block is cut only once the
+  accumulated bytes reach `sstable-block-size` AND the user_key changes, so a
+  single user_key's versions are never split across blocks (a block may therefore
+  exceed the target size when one key has many versions)."
+  [writer ikey data]
+  (let [st @(:state writer)
+        uk (:user-key ikey)
+        size (io/entry-size-on-disk ikey data)
+        cut? (and (:block-first st)
+                  (>= (long (:block-bytes st)) (long (:block-size writer)))
+                  (not (data/byte-array-equals? uk (:last-key st))))
+        st (if cut?
+             (-> st
+                 (update :blocks conj [(:block-first st) (:block-start st)])
+                 (assoc :block-first nil :block-start nil :block-bytes 0))
+             st)
+        st (if (nil? (:block-first st))
+             (assoc st :block-first uk :block-start (:offset st) :block-bytes 0)
+             st)]
+    (io/append-entry! (:out-stream writer) [ikey data])
+    (blossom/add (:bloom writer) uk)
+    (reset! (:state writer)
+            (-> st
+                (update :offset + size)
+                (update :block-bytes + size)
+                (assoc :last-key uk)
+                (update :head #(or % uk))
+                (assoc :tail uk)))
+    nil))
+
+(defn close-table!
+  "Close the final block, append the index region + trailer, fsync and close.
+  Returns the table entry for a manifest edit. `:index` / `:index-start` are the
+  in-memory read structure -- derived from the file, NOT stored in the manifest."
+  [writer level]
+  (let [st @(:state writer)
+        blocks (cond-> (:blocks st)
+                 (:block-first st) (conj [(:block-first st) (:block-start st)]))
+        out-stream ^BufferedOutputStream (:out-stream writer)
+        file-stream ^FileOutputStream (:file-stream writer)]
+    (io/write-footer! out-stream blocks (:offset st))
+    (.flush out-stream)
+    (-> file-stream .getChannel (.force true))
+    (.close out-stream)
+    (.close file-stream)
+    {:id (:id writer) :level level
+     :head-key (:head st) :tail-key (:tail st)
+     :bloom-filter (:bloom writer)
+     :index blocks
+     :index-start (:offset st)
+     :size (.length (File. ^String (:path writer)))}))
 
 ;; SSTable metadata is managed as `[table-id info]`, where `info` is a map
 ;; `{:head-key :tail-key :bloom-filter :size}` (the bloom filter is a live
@@ -91,7 +163,7 @@
         (loop [tables (select-order version)]
           (when-let [[id table] (first tables)]
             (if-let [v (and (blossom/hit? (:bloom-filter table) k)
-                            (io/read-value (get-sstable-path id dir) k snapshot-seq))]
+                            (io/read-value (get-sstable-path id dir) k snapshot-seq table))]
               v
               (recur (next tables))))))))
   (scan
@@ -116,7 +188,7 @@
                  ;; the newest version <= snapshot within its file
                  (reduce (fn [m [k d]] (assoc m k d))
                          pairs
-                         (io/scan-pairs sstable-path from-key to-key snapshot-seq))
+                         (io/scan-pairs sstable-path from-key to-key snapshot-seq table))
                  pairs)
                (rest tables))))))))
   (latest-seq
@@ -130,7 +202,7 @@
         (loop [tables (select-order version)]
           (when-let [[id table] (first tables)]
             (if-let [s (and (blossom/hit? (:bloom-filter table) k)
-                            (io/read-latest-seq (get-sstable-path id dir) k))]
+                            (io/read-latest-seq (get-sstable-path id dir) k table))]
               s
               (recur (next tables)))))))))
 
@@ -138,7 +210,7 @@
 
 (defn- entry->pair
   [entry]
-  [(:id entry) (select-keys entry [:head-key :tail-key :bloom-filter :size])])
+  [(:id entry) (select-keys entry [:head-key :tail-key :bloom-filter :size :index :index-start])])
 
 (defn apply-edit
   "Fold one version edit (bloom filters as *objects*) into the per-level table
@@ -231,7 +303,17 @@
   (io/make-dir sstable-dir)
   (let [raw-edits (manifest/read-edits (manifest/manifest-path config))
         edits (map #(deserialize-edit-blooms % (:bloom-filter config)) raw-edits)
-        version (reduce apply-edit [[]] edits)
+        ;; Load each LIVE table's footer (sparse index) after folding the edits --
+        ;; a table added by one edit and deleted by a later one has no file left,
+        ;; so it must never be opened. The index is derived from the file, not the
+        ;; manifest, and lives in memory for the table's lifetime.
+        version (mapv (fn [level]
+                        (mapv (fn [[id info]]
+                                [id (merge info
+                                           (io/read-footer!
+                                            (get-sstable-path id sstable-dir)))])
+                              level))
+                      (reduce apply-edit [[]] edits))
         max-id (reduce (fn [m e] (reduce (fn [m a] (max m (:id a))) m (:added e)))
                        -1 raw-edits)
         manifest-max-seq (reduce (fn [m e] (max m (or (:max-seq e) 0))) 0 raw-edits)

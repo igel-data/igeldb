@@ -22,17 +22,12 @@
   TODO (memory): the merge materializes all input entries in a TreeMap. A
   streaming k-way merge over the (already sorted) inputs would bound compaction
   memory; deferred for now."
-  (:require [blossom.core :as blossom]
-            [clojure.java.io :as java-io]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
             [clojure.tools.logging :as logging]
             [igeldb.data :as data]
             [igeldb.io :as io]
             [igeldb.sstable :as sstable]
-            [igeldb.tx :as tx])
-  (:import (java.io FileOutputStream BufferedOutputStream File)))
-
-(def ^:private ^:const SEG_OVERHEAD 16) ;; 8-byte length + 8-byte CRC per segment
+            [igeldb.tx :as tx]))
 
 ;; ---- level geometry ------------------------------------------------------
 
@@ -138,21 +133,6 @@
 
 ;; ---- merge + output ------------------------------------------------------
 
-(defn- read-all-pairs
-  "Read every [ikey data] entry from an SSTable file (compaction reads whole
-  tables)."
-  [path]
-  (with-open [in (java-io/input-stream path)]
-    (io/read-format-byte! in path)
-    (loop [acc (transient [])]
-      (let [entry (io/read-kv-pair! in)]
-        (cond
-          (= :eof entry) (persistent! acc)
-          (or (= :truncated entry) (= :corrupt entry))
-          (throw (ex-info "SSTable is corrupted (compaction input)"
-                          {:path path :reason entry}))
-          :else (recur (conj! acc entry)))))))
-
 (defn- gc-versions
   "Apply the MVCC GC rule to one user_key's versions (a coll of [ikey data]).
   Keep every version with seq > `floor` plus the newest version with seq <= floor
@@ -186,39 +166,11 @@
                  (fn [m path]
                    (reduce (fn [m [ikey data]]
                              (update m (:user-key ikey) (fnil conj []) [ikey data]))
-                           m (read-all-pairs path)))
+                           m (io/read-all-entries path)))
                  (sorted-map-by (data/byte-array-comparator))
                  paths-low-to-high)]
     (mapcat (fn [[_uk versions]] (gc-versions versions floor drop-tombstones?))
             by-user)))
-
-(defn- entry-bytes
-  [ikey data]
-  (+ SEG_OVERHEAD Long/BYTES (count ^bytes (:user-key ikey))
-     (if (:deleted? data) 8 (+ SEG_OVERHEAD (count ^bytes (:value data))))))
-
-(defn- start-table!
-  [sstable-id {:keys [sstable-dir bloom-filter]}]
-  (let [id (sstable/next-id! sstable-id)
-        path (sstable/get-sstable-path id sstable-dir)
-        file-stream (FileOutputStream. path)
-        out-stream (BufferedOutputStream. file-stream 16384)]
-    (io/write-format-byte! out-stream)
-    {:id id :path path
-     :file-stream file-stream
-     :out-stream out-stream
-     :bloom (blossom/make-filter bloom-filter)
-     :head nil :tail nil :bytes 0}))
-
-(defn- finish-table!
-  [t out-level]
-  (.flush ^BufferedOutputStream (:out-stream t))
-  (-> ^FileOutputStream (:file-stream t) .getChannel (.force true))
-  (.close ^BufferedOutputStream (:out-stream t))
-  (.close ^FileOutputStream (:file-stream t))
-  {:id (:id t) :level out-level
-   :head-key (:head t) :tail-key (:tail t)
-   :bloom-filter (:bloom t) :size (.length (File. ^String (:path t)))})
 
 (defn- write-output!
   "Write the merged [ikey data] seq into non-overlapping output SSTables of about
@@ -233,21 +185,17 @@
          cur nil
          out []]
     (if (empty? entries)
-      (if cur (conj out (finish-table! cur out-level)) out)
+      (if cur (conj out (sstable/close-table! cur out-level)) out)
       (let [[ikey data] (first entries)
             uk (:user-key ikey)
-            cur (or cur (start-table! sstable-id config))
-            _ (sstable/write-entry! (:out-stream cur) (:bloom cur) ikey data)
-            cur (-> cur
-                    (update :head #(or % uk))
-                    (assoc :tail uk)
-                    (update :bytes + (entry-bytes ikey data)))
+            cur (or cur (sstable/open-table! (sstable/next-id! sstable-id) config))
+            _ (sstable/write-entry! cur ikey data)
             remaining (rest entries)
             next-uk (when (seq remaining) (:user-key (first (first remaining))))]
         ;; only cut at a user_key boundary, so all versions of a key stay together
-        (if (and (>= (:bytes cur) sstable-target-size)
+        (if (and (>= (sstable/table-bytes cur) (long sstable-target-size))
                  (or (nil? next-uk) (not (data/byte-array-equals? next-uk uk))))
-          (recur remaining nil (conj out (finish-table! cur out-level)))
+          (recur remaining nil (conj out (sstable/close-table! cur out-level)))
           (recur remaining cur out))))))
 
 ;; ---- one compaction ------------------------------------------------------
