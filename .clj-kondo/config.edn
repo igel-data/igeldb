@@ -1,0 +1,4 @@
+;; Teach clj-kondo the binding shape of our binding-form macros so their bound
+;; symbols resolve. Both take a `[sym init]` binding vector like `let`.
+{:lint-as {igeldb.core/with-tx clojure.core/let
+           igeldb.transaction-test/with-store clojure.core/let}}
