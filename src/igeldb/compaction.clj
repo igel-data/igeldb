@@ -307,8 +307,11 @@
       (loop []
         (when (some? (async/<!! req-chan)) ;; nil -> shutdown
           (when (nil? @poison)
+            ;; re-check poison between compactions so a close/fault stops the drain
+            ;; promptly instead of running one more compaction (which could read
+            ;; files a shutting-down caller is about to delete)
             (loop []
-              (when (true? (safe-compact!))
+              (when (and (nil? @poison) (true? (safe-compact!)))
                 (locking stall-monitor (.notifyAll stall-monitor))
                 (recur))))
           (when (nil? @poison)

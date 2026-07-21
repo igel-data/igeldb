@@ -208,6 +208,9 @@
                 (try (.close file-stream) (catch Throwable _))
                 false))]
         (when healthy?
-            ;; Wait for the new memtable generation from the flush writer.
-          (let [[wal-id memtable] (async/<! flush-wal-chan)]
+          ;; Wait for the next memtable generation from the flush writer. On
+          ;; shutdown the flush writer closes `flush-wal-chan` instead of sending
+          ;; one, so a nil here means "shut down" -> end the go-loop (its channel
+          ;; then closes, and `close!` joins on it).
+          (when-let [[wal-id memtable] (async/<! flush-wal-chan)]
             (recur wal-id memtable)))))))

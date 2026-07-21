@@ -134,7 +134,13 @@
                            ;; close the data channel not to send data to the WAL thread
                            (async/close! (:wal-chan @memtable)))
                          (recur))
-            ;; nil: `req-chan` was closed -> shutdown. Close the WAL channel so
-            ;; the worker drains and fsyncs any buffered entries; those are
-            ;; recovered from the WAL by replay on restart. Then END the loop.
-            (async/close! (:wal-chan @memtable))))))))
+            ;; nil: `req-chan` closed -> shutdown; end the loop, then clean up below.
+            nil))
+        ;; The loop ends on shutdown (req-chan closed) OR on a fault (a flush failed
+        ;; and did not recur). Either way stop the WAL worker so it never parks
+        ;; forever: close its data channel (it drains + fsyncs any buffered entries,
+        ;; recovered by replay on restart) and the generation hand-off channel (so it
+        ;; exits instead of awaiting a next generation that never comes). Both closes
+        ;; are idempotent. This thread then returns and `close!` joins on it.
+        (async/close! (:wal-chan @memtable))
+        (async/close! flush-wal-chan)))))

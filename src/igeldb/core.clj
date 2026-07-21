@@ -12,10 +12,11 @@
             [igeldb.wal :as wal])
   (:gen-class))
 
-;; The Coordinator is the control plane the foreground (KVS) uses to interact
-;; with the background workers. It deliberately does NOT hold the workers
-;; themselves: the flush writer is a real thread and the WAL worker is a go-loop
-;; parked on reachable channels, so both stay alive on their own.
+;; The Coordinator is the control plane the foreground (KVS) uses to interact with
+;; the background workers. The workers run on their own (the flush writer and
+;; compaction worker are real threads, the WAL worker a go-loop); the Coordinator
+;; drives them through channels and keeps each worker's completion channel
+;; (`worker-chans`) so `close!` can join on shutdown -- see below.
 ;;
 ;; `poison` holds the fatal exception once an IO error trips fail-stop (nil while
 ;; healthy). The WAL worker and flush writer set it; every write/delete checks it.
@@ -23,8 +24,12 @@
 ;; generation (true on success, false if poisoned during init).
 ;; `stall-monitor` is the back-pressure condition: writers wait on it while L0
 ;; is saturated; the compaction worker and the poison watch notify it.
+;; `worker-chans` are the `async/thread`/`go-loop` channels of the three background
+;; workers (flush writer, WAL worker, compaction worker); each closes when its
+;; worker exits, so `close!` can join on them and return only once no worker is
+;; still touching files.
 (defrecord Coordinator [flush-req-chan compaction-req-chan poison ready
-                        stall-monitor])
+                        stall-monitor worker-chans])
 
 (defn spawn-bg-workers
   [memtable immutable-memtable tree registry sstable-id wal-id config]
@@ -43,16 +48,18 @@
                (fn [_ _ old new]
                  (when (and (nil? old) new)
                    (locking stall-monitor (.notifyAll stall-monitor)))))
-    ;; Spawn the workers for their side effects; their return channels are
-    ;; unused (see the Coordinator note above).
-    (f/spawn-flush-writer memtable immutable-memtable tree sstable-id wal-id
-                          poison ready flush-req-chan flush-wal-chan
-                          compaction-req-chan config)
-    (wal/spawn-wal-writer poison flush-req-chan flush-wal-chan config)
-    (compaction/spawn-compaction-worker tree sstable-id compact-pointers registry
-                                        poison stall-monitor compaction-req-chan
-                                        config)
-    (->Coordinator flush-req-chan compaction-req-chan poison ready stall-monitor)))
+    ;; Spawn the workers; keep each one's completion channel so `close!` can join
+    ;; on it (a worker's channel closes when the worker exits).
+    (let [flush-done (f/spawn-flush-writer memtable immutable-memtable tree
+                                           sstable-id wal-id poison ready
+                                           flush-req-chan flush-wal-chan
+                                           compaction-req-chan config)
+          wal-done (wal/spawn-wal-writer poison flush-req-chan flush-wal-chan config)
+          compaction-done (compaction/spawn-compaction-worker
+                           tree sstable-id compact-pointers registry poison
+                           stall-monitor compaction-req-chan config)]
+      (->Coordinator flush-req-chan compaction-req-chan poison ready stall-monitor
+                     [flush-done wal-done compaction-done]))))
 
 (defn- terminate-workers
   [coordinator]
@@ -279,6 +286,8 @@
 
 ;; ==== Main APIs ====
 
+(def ^:private ^:const SHUTDOWN_TIMEOUT_MS 30000)
+
 (defn close!
   "Shut the store down: reject further writes, then stop the background workers.
   Explicit shutdown (rather than an `Object.finalize` hook -- GC finalization is
@@ -289,11 +298,25 @@
   `write!`/`delete!` and `select`/`scan` -- fails fast with a clear \"store is
   closed\" error, and any stalled writer is woken (the poison watch fires).
   `compare-and-set!` leaves an existing fault in place so a poisoned-then-closed
-  store still reports its original cause."
+  store still reports its original cause.
+
+  `close!` is synchronous: after signaling shutdown it JOINS the background workers
+  (each worker's channel closes when it exits), so once `close!` returns no flush or
+  compaction thread is still reading/writing SSTable or WAL files -- a caller may
+  safely delete the data directory immediately. The join is bounded by
+  `SHUTDOWN_TIMEOUT_MS` so a wedged worker cannot hang `close!` forever."
   [^KVS kvs]
   (info "KVS is shutting down...")
-  (compare-and-set! (:poison (:coordinator kvs)) nil :closed)
-  (terminate-workers (:coordinator kvs)))
+  (let [coordinator (:coordinator kvs)]
+    (compare-and-set! (:poison coordinator) nil :closed)
+    (terminate-workers coordinator)
+    ;; Join the workers. A single shared timeout bounds the total wait: once it
+    ;; fires, remaining joins fall through immediately.
+    (let [deadline (async/timeout SHUTDOWN_TIMEOUT_MS)]
+      (doseq [done (:worker-chans coordinator)]
+        (async/alt!!
+          done ([_] nil)
+          deadline ([_] (info "A background worker did not stop before the shutdown timeout")))))))
 
 (def ^:private ^:const INIT_TIMEOUT_MS 30000)
 
