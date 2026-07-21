@@ -27,7 +27,7 @@
                         stall-monitor])
 
 (defn spawn-bg-workers
-  [memtable immutable-memtable tree sstable-id wal-id config]
+  [memtable immutable-memtable tree registry sstable-id wal-id config]
   (let [flush-req-chan (async/chan)
         flush-wal-chan (async/chan)
         ;; sliding-buffer so a flush never blocks signaling and signals coalesce
@@ -49,8 +49,9 @@
                           poison ready flush-req-chan flush-wal-chan
                           compaction-req-chan config)
     (wal/spawn-wal-writer poison flush-req-chan flush-wal-chan config)
-    (compaction/spawn-compaction-worker tree sstable-id compact-pointers poison
-                                        stall-monitor compaction-req-chan config)
+    (compaction/spawn-compaction-worker tree sstable-id compact-pointers registry
+                                        poison stall-monitor compaction-req-chan
+                                        config)
     (->Coordinator flush-req-chan compaction-req-chan poison ready stall-monitor)))
 
 (defn- terminate-workers
@@ -313,7 +314,7 @@
         ;; serializes the commit-handler's {conflict-check -> seq assign ->
         ;; enqueue} critical section (see `commit!`)
         commit-lock (Object.)
-        coordinator (spawn-bg-workers memtable immutable-memtable tree
+        coordinator (spawn-bg-workers memtable immutable-memtable tree registry
                                       (atom sstable-id) (atom wal-id) config)]
     ;; Block until the initial flush has established the first WAL generation
     ;; (and, on restart, committed the replayed WAL to an SSTable).

@@ -79,6 +79,71 @@
     (.flush os)
     (-> fs .getChannel (.force true))))
 
+(defn- write-versions!
+  "Write [k-str seq v-str-or-nil] entries (nil = tombstone) as a raw SSTable with
+  explicit per-entry seqs. Entries should be in user_key-asc / seq-desc order."
+  [path entries]
+  (with-open [fs (FileOutputStream. path)
+              os (BufferedOutputStream. fs)]
+    (io/write-format-byte! os)
+    (doseq [[k seq v] entries]
+      (io/append-entry! os [(data/->ikey (->bytes k) seq)
+                            (if v (data/new-data (->bytes v)) (data/deleted-data))]))
+    (.flush os)
+    (-> fs .getChannel (.force true))))
+
+(defn- seqs-of
+  "The seqs of the merged entries for user_key `k`, in output order."
+  [merged k]
+  (->> merged
+       (filter #(b= (->bytes k) (:user-key (first %))))
+       (mapv (comp :seq first))))
+
+;; ---- Step 6: MVCC GC by the min-active-snapshot floor --------------------
+
+(deftest gc-keeps-floor-survivor-plus-newer-drops-older-test
+  (let [dir "./test-data/compaction-gc-floor"]
+    (.mkdirs (jio/file dir))
+    (let [path (str dir "/versions.sst")]
+      ;; key "k" at seqs 9, 6, 3 (all values); an unrelated key "z"
+      (write-versions! path [["k" 9 "v9"] ["k" 6 "v6"] ["k" 3 "v3"] ["z" 5 "vz"]])
+      (testing "floor between versions: keep all > floor plus the newest <= floor"
+        (is (= [9 6] (seqs-of (vec (compaction/merge-inputs [path] 6 false)) "k"))
+            "seq 9 (> floor) and seq 6 (floor survivor) kept; seq 3 dropped"))
+      (testing "no live tx (floor >= newest): collapse to the single newest version"
+        (is (= [9] (seqs-of (vec (compaction/merge-inputs [path] 100 false)) "k"))))
+      (testing "floor below every version: nothing is <= floor, so all survive"
+        (is (= [9 6 3] (seqs-of (vec (compaction/merge-inputs [path] 2 false)) "k"))))
+      (rm-rf dir))))
+
+(deftest gc-tombstone-dropped-only-at-bottom-level-test
+  (let [dir "./test-data/compaction-gc-tombstone"]
+    (.mkdirs (jio/file dir))
+    (let [path (str dir "/versions.sst")]
+      ;; key "d": tombstone@8 shadowing value@4; floor high (collapse to newest)
+      (write-versions! path [["d" 8 nil] ["d" 4 "old"]])
+      (testing "non-bottom level: the surviving tombstone is preserved"
+        (let [merged (vec (compaction/merge-inputs [path] 100 false))]
+          (is (= [8] (seqs-of merged "d")))
+          (is (:deleted? (second (first merged))) "kept entry is the tombstone")))
+      (testing "bottom level: the surviving tombstone (and its shadowed value) drop"
+        (is (empty? (compaction/merge-inputs [path] 100 true))))
+      (rm-rf dir))))
+
+(deftest gc-keeps-above-floor-tombstone-even-at-bottom-test
+  ;; A tombstone with seq > floor is a "newer version" and must be kept (a live tx
+  ;; may need to see the deletion) -- even at the bottom level, where only the floor
+  ;; survivor may be dropped.
+  (let [dir "./test-data/compaction-gc-tombstone-above"]
+    (.mkdirs (jio/file dir))
+    (let [path (str dir "/versions.sst")]
+      (write-versions! path [["d" 10 nil] ["d" 3 "old"]]) ;; tombstone@10, value@3
+      (let [merged (vec (compaction/merge-inputs [path] 5 true))] ;; floor 5, bottom
+        (is (= [10 3] (seqs-of merged "d"))
+            "above-floor tombstone kept; value@3 is the floor survivor, kept")
+        (is (:deleted? (second (first merged))) "newest kept entry is the tombstone"))
+      (rm-rf dir))))
+
 (deftest merge-newest-wins-and-tombstone-at-bottom-test
   (let [dir "./test-data/compaction-merge"]
     (.mkdirs (jio/file dir))
@@ -87,11 +152,12 @@
       (write-sst! older 5 [["alive" "y"] ["gone" "x"]])
       (write-sst! newer 10 [["gone" nil]]) ;; newer (higher seq) tombstone wins
       (testing "bottom level: the tombstone (and the value it shadows) are dropped"
-        (let [merged (vec (compaction/merge-inputs [older newer] true))]
+        ;; floor = MAX_VALUE: no live tx, so each key collapses to its newest version
+        (let [merged (vec (compaction/merge-inputs [older newer] Long/MAX_VALUE true))]
           (is (= ["alive"] (mapv (comp #(String. %) :user-key first) merged))
               "only the live key survives")))
       (testing "non-bottom level: the tombstone is preserved to shadow deeper data"
-        (let [merged (compaction/merge-inputs [older newer] false)
+        (let [merged (compaction/merge-inputs [older newer] Long/MAX_VALUE false)
               m (into {} (map (fn [[ikey d]] [(String. (:user-key ikey)) (:deleted? d)])
                               merged))]
           (is (= {"alive" false "gone" true} m)))))
@@ -244,5 +310,30 @@
       (is (= referenced on-disk)
           (str "superseded files not cleaned / referenced file missing"
                " -- version=" referenced " disk=" on-disk)))
+    (igel/close! kvs)
+    (rm-rf data-dir)))
+
+;; ---- Step 6: a live tx's version survives MVCC GC ------------------------
+
+(deftest live-tx-version-survives-compaction-test
+  ;; The MVCC guarantee: while a tx is alive, the GC floor (= its snapshot) keeps the
+  ;; version it can see. So even after that version is flushed and compacted many
+  ;; times, the tx still reads its snapshot value -- never a newer one, never nil.
+  (let [data-dir "./test-data/compaction-live-tx"
+        kvs (igel/gen-kvs (config-path! data-dir))]
+    (igel/write! kvs (->bytes "k") (->bytes "v0"))
+    (let [tx (igel/begin-tx kvs)]
+      ;; churn: overwrite k and write filler so k@v0 is flushed and compacted while
+      ;; the tx is alive (floor pinned at the tx's snapshot preserves v0)
+      (dotimes [i 500]
+        (igel/write! kvs (->bytes "k") (->bytes (str "v" (inc i))))
+        (igel/write! kvs (->bytes (format "f%05d" i)) (->bytes "x")))
+      (wait-until #(l1+-populated? kvs))
+      (wait-stable kvs)
+      (is (b= (->bytes "v0") (igel/tx-get tx (->bytes "k")))
+          "the live tx still sees v0 after compaction (its version was not GC'd)")
+      (is (b= (->bytes "v500") (igel/select kvs (->bytes "k")))
+          "a non-tx read still sees the latest value")
+      (igel/rollback-tx tx))
     (igel/close! kvs)
     (rm-rf data-dir)))

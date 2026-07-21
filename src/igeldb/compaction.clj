@@ -28,7 +28,8 @@
             [clojure.tools.logging :as logging]
             [igeldb.data :as data]
             [igeldb.io :as io]
-            [igeldb.sstable :as sstable])
+            [igeldb.sstable :as sstable]
+            [igeldb.tx :as tx])
   (:import (java.io FileOutputStream BufferedOutputStream File)))
 
 (def ^:private ^:const SEG_OVERHEAD 16) ;; 8-byte length + 8-byte CRC per segment
@@ -152,28 +153,44 @@
                           {:path path :reason entry}))
           :else (recur (conj! acc entry)))))))
 
+(defn- gc-versions
+  "Apply the MVCC GC rule to one user_key's versions (a coll of [ikey data]).
+  Keep every version with seq > `floor` plus the newest version with seq <= floor
+  (the floor survivor -- what the oldest live tx, at snapshot = floor, sees); drop
+  the versions older than that survivor. At the bottom-most output level a
+  surviving tombstone is dropped as well (`drop-tombstones?`): its older versions
+  are already gone and nothing below can resurrect a value. Returns the kept
+  entries in seq-descending order (the on-disk order within a user_key).
+
+  GC is judged only within these inputs (conservative): a stale version stranded
+  in a deeper level is reclaimed when that level is later compacted."
+  [versions floor drop-tombstones?]
+  (let [sorted (sort-by (comp :seq first) > versions)
+        [above below] (split-with (fn [[ikey _]] (> (:seq ikey) floor)) sorted)
+        survivor (first below)]
+    (if (and survivor drop-tombstones? (:deleted? (second survivor)))
+      above
+      (if survivor (concat above [survivor]) above))))
+
 (defn merge-inputs
   "Merge input file paths given LOW->HIGH precedence into a user_key-sorted seq of
-  [ikey data]. Step 1 collapses to the single newest version (max seq) per
-  user_key; Step 6 will keep multiple versions per the MVCC GC floor. Drops
-  tombstones only at the bottom-most level (`drop-tombstones?`)."
-  [paths-low-to-high drop-tombstones?]
+  [ikey data], applying MVCC GC per user_key against `floor`
+  (= min-active-snapshot-seq): keep every version with seq > floor plus the newest
+  version with seq <= floor, drop older ones (see `gc-versions`). At the bottom-most
+  level a surviving tombstone is dropped too (`drop-tombstones?`).
+
+  With no live tx `floor` is the current seq, so every version is <= floor and each
+  user_key collapses to its single newest version -- the pre-MVCC behavior."
+  [paths-low-to-high floor drop-tombstones?]
   (let [by-user (reduce
                  (fn [m path]
                    (reduce (fn [m [ikey data]]
-                             (let [uk (:user-key ikey)
-                                   cur (get m uk)]
-                               (if (or (nil? cur)
-                                       (> (:seq ikey) (:seq (first cur))))
-                                 (assoc m uk [ikey data])
-                                 m)))
+                             (update m (:user-key ikey) (fnil conj []) [ikey data]))
                            m (read-all-pairs path)))
                  (sorted-map-by (data/byte-array-comparator))
                  paths-low-to-high)]
-    (keep (fn [[_uk [ikey data]]]
-            (when-not (and drop-tombstones? (:deleted? data))
-              [ikey data]))
-          by-user)))
+    (mapcat (fn [[_uk versions]] (gc-versions versions floor drop-tombstones?))
+            by-user)))
 
 (defn- entry-bytes
   [ikey data]
@@ -206,7 +223,11 @@
 (defn- write-output!
   "Write the merged [ikey data] seq into non-overlapping output SSTables of about
   `sstable-target-size` bytes at `out-level`, allocating fresh ids. Returns the
-  vector of edit entries for the new tables (head/tail are user_keys)."
+  vector of edit entries for the new tables (head/tail are user_keys).
+
+  A user_key's multiple versions (MVCC) are never split across two output tables:
+  a size-based cut is deferred until the user_key changes, so no two L1+ output
+  tables share a key -- preserving the non-overlapping-ranges invariant."
   [merged out-level sstable-id {:keys [sstable-target-size] :as config}]
   (loop [entries merged
          cur nil
@@ -220,10 +241,14 @@
             cur (-> cur
                     (update :head #(or % uk))
                     (assoc :tail uk)
-                    (update :bytes + (entry-bytes ikey data)))]
-        (if (>= (:bytes cur) sstable-target-size)
-          (recur (rest entries) nil (conj out (finish-table! cur out-level)))
-          (recur (rest entries) cur out))))))
+                    (update :bytes + (entry-bytes ikey data)))
+            remaining (rest entries)
+            next-uk (when (seq remaining) (:user-key (first (first remaining))))]
+        ;; only cut at a user_key boundary, so all versions of a key stay together
+        (if (and (>= (:bytes cur) sstable-target-size)
+                 (or (nil? next-uk) (not (data/byte-array-equals? next-uk uk))))
+          (recur remaining nil (conj out (finish-table! cur out-level)))
+          (recur remaining cur out))))))
 
 ;; ---- one compaction ------------------------------------------------------
 
@@ -231,13 +256,18 @@
   "Run one compaction if the store needs it. Returns true if a compaction was
   performed, nil if nothing needed compacting. Throws on IO failure (the worker
   poisons the store)."
-  [tree sstable-id compact-pointers config]
+  [tree sstable-id compact-pointers registry config]
   (let [version @(:current-version tree)]
     (when-let [plan (pick-compaction version compact-pointers config)]
       (let [dir (:dir tree)
+            ;; the MVCC GC floor: read once at the start of the compaction. A tx
+            ;; that begins later pins a snapshot >= the current seq >= this floor
+            ;; (see begin-tx's lock), so versions we keep cover every live/future
+            ;; tx; older versions below the floor are safe to drop.
+            floor (tx/min-active-snapshot-seq registry)
             paths (map #(sstable/get-sstable-path (first %) dir)
                        (:inputs-low-to-high plan))
-            merged (merge-inputs paths (:drop-tombstones? plan))
+            merged (merge-inputs paths floor (:drop-tombstones? plan))
             out-entries (write-output! merged (:out-level plan) sstable-id config)]
         (logging/info "Compaction L" (:level plan) "-> L" (:out-level plan)
                       ":" (count (:deleted-ids plan)) "inputs ->"
@@ -258,10 +288,11 @@
 
   After every compaction it notifies `stall-monitor`: a compaction drains L0, so
   any writers stalled by back-pressure should re-check and may proceed."
-  [tree sstable-id compact-pointers poison ^Object stall-monitor req-chan config]
+  [tree sstable-id compact-pointers registry poison ^Object stall-monitor req-chan
+   config]
   (letfn [(safe-compact! []
             (try
-              (compact! tree sstable-id compact-pointers config)
+              (compact! tree sstable-id compact-pointers registry config)
               (catch Throwable e
                 (reset! poison e)
                 (logging/error e "Compaction failed; the store is poisoned")
