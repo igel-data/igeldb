@@ -122,8 +122,9 @@
     {:retriable true}; retry up to `write-retries` times, then give up. The last
     retriable failure is preserved as the cause.
 
-  Non-retriable exceptions propagate unchanged. `op` is :write or :delete,
-  used only for the message."
+  Non-retriable exceptions propagate unchanged. Returns `mutate!`'s value on
+  success (nil for auto-commit writes; the commit outcome for a tx commit). `op` is
+  :write / :delete / :commit-tx, used only for the message."
   [coordinator tree config op mutate!]
   (let [poison (:poison coordinator)
         monitor (:stall-monitor coordinator)
@@ -136,22 +137,22 @@
       (await-l0-capacity! monitor (:current-version tree) poison threshold)
       (when-let [p @poison]
         (throw (unusable-ex p op)))
-      (let [err (try
-                  (mutate!)
-                  nil
-                  (catch clojure.lang.ExceptionInfo e
-                    (cond
-                      ;; a closed wal-chan looks like a retriable memtable switch;
-                      ;; if the store is actually unusable, surface that instead
-                      @poison (throw (unusable-ex @poison op))
-                      (-> e ex-data :retriable) e
-                      :else (throw e))))]
-        (when err
+      (let [outcome (try
+                      {:ok (mutate!)}
+                      (catch clojure.lang.ExceptionInfo e
+                        (cond
+                          ;; a closed wal-chan looks like a retriable memtable
+                          ;; switch; if the store is actually unusable, surface that
+                          @poison (throw (unusable-ex @poison op))
+                          (-> e ex-data :retriable) {:err e}
+                          :else (throw e))))]
+        (if (contains? outcome :ok)
+          (:ok outcome)
           (if (pos? retries)
             (do (Thread/sleep 100)
                 (recur (dec retries)))
             (throw (ex-info (str (name op) " failed repeatedly")
-                            {:retriable false} err))))))))
+                            {:retriable false} (:err outcome)))))))))
 
 (defn- reject-if-closed!
   "Reads reject once the store is closed (a fully unusable store). A *fault*-
@@ -344,3 +345,123 @@
   "Delete the given key from the key-value store."
   [^KVS kvs ^bytes k]
   (store/delete! kvs k))
+
+;; ==== Transactions (snapshot isolation) ====
+;;
+;; A transaction pins a snapshot = a fixed seq at `begin-tx` (NOT a held version --
+;; reads take the current version briefly and filter by this seq; the GC floor keeps
+;; every version the snapshot needs alive, see `igeldb.tx`). Reads/writes buffer into
+;; a write-set; `commit-tx` runs the whole write-set through the commit-handler under
+;; standard snapshot isolation (write-write conflicts detected, first-committer-wins;
+;; write skew is allowed). A read-only tx (empty write-set) commits for free.
+
+(defn- empty-write-set
+  "A write-set is a sorted-map keyed by user_key (content equality via the
+  byte-array comparator), value a `Data` (a value or a tombstone). Same-key writes
+  fold to the last one."
+  []
+  (sorted-map-by (data/byte-array-comparator)))
+
+(defrecord Tx [kvs snapshot-seq write-set finished?])
+
+(defn begin-tx
+  "Start a transaction: pin the snapshot seq, register it in the active set (so the
+  GC floor preserves the versions it can see), and start with an empty write-set.
+  Reading `current-seq` and registering happen under the commit lock so no commit
+  can advance the seq in between -- while the lock is held the seq is frozen, so a
+  concurrent GC-floor computation that misses the registration still sees no version
+  newer than this snapshot, keeping the floor safe."
+  [^KVS kvs]
+  (reject-if-closed! (:coordinator kvs) :begin-tx)
+  (let [registry (:registry kvs)
+        commit-lock (:commit-lock kvs)
+        snapshot-seq (locking commit-lock
+                       (let [s (tx/current-seq registry)]
+                         (tx/register-snapshot! registry s)
+                         s))]
+    (->Tx kvs snapshot-seq (atom (empty-write-set)) (atom false))))
+
+(defn- finish!
+  "Deregister the tx's snapshot exactly once (idempotent via CAS), so an explicit
+  commit/rollback plus `with-tx`'s finally never double-decrement the active set."
+  [^Tx tx]
+  (when (compare-and-set! (:finished? tx) false true)
+    (tx/deregister-snapshot! (:registry (:kvs tx)) (:snapshot-seq tx))))
+
+(defn tx-get
+  "Read `k` inside the tx: the tx's own buffered write wins (read-your-writes),
+  otherwise the store at the tx's snapshot seq. Returns the value bytes, or nil for
+  an absent key or the tx's own tombstone."
+  [^Tx tx ^bytes k]
+  (let [ws @(:write-set tx)]
+    (if (contains? ws k)
+      (let [d (get ws k)] (when (data/is-valid? d) (:value d)))
+      (store/select (:kvs tx) k (:snapshot-seq tx)))))
+
+(defn tx-put
+  "Buffer a write of `k`=`v` into the tx's write-set (folding an earlier write of
+  the same key). Not durable until `commit-tx`."
+  [^Tx tx ^bytes k ^bytes v]
+  (swap! (:write-set tx) assoc k (data/new-data v))
+  nil)
+
+(defn tx-delete
+  "Buffer a delete of `k` into the tx's write-set (a tombstone). Not durable until
+  `commit-tx`."
+  [^Tx tx ^bytes k]
+  (swap! (:write-set tx) assoc k (data/deleted-data))
+  nil)
+
+(defn- tx-commit-attempt!
+  "One commit-handler attempt for a tx: :committed / :conflict, or a retriable throw
+  on a memtable switch (so `run-mutation!` retries the enqueue)."
+  [kvs snapshot-seq entries]
+  (case (commit! kvs snapshot-seq entries)
+    :committed :committed
+    :conflict :conflict
+    :switched (throw (ex-info "commit hit a memtable switch" {:retriable true}))))
+
+(defn commit-tx
+  "Commit the transaction. An empty write-set (a read-only tx) is a no-op. Otherwise
+  the whole write-set goes through the commit-handler at the tx's snapshot seq
+  (write-write conflict detection, first-committer-wins). Returns `:committed`; on a
+  conflict throws an ex-info tagged `:igeldb/conflict` (retriable) that the caller
+  may catch to retry -- the tx is rolled back (deregistered) either way. The snapshot
+  is always deregistered exactly once."
+  [^Tx tx]
+  (let [{:keys [kvs snapshot-seq write-set]} tx
+        ws @write-set]
+    (try
+      (if (empty? ws)
+        :committed
+        (let [result (run-mutation! (:coordinator kvs) (:tree kvs) (:config kvs)
+                                    :commit-tx
+                                    #(tx-commit-attempt! kvs snapshot-seq (vec ws)))]
+          (if (= result :conflict)
+            (throw (ex-info "Transaction conflict; the write-set was committed by another tx"
+                            {:igeldb/conflict true :retriable true}))
+            :committed)))
+      (finally (finish! tx)))))
+
+(defn rollback-tx
+  "Abort the transaction: discard the buffered write-set and deregister the snapshot.
+  Idempotent with `commit-tx` (the snapshot is deregistered exactly once)."
+  [^Tx tx]
+  (reset! (:write-set tx) (empty-write-set))
+  (finish! tx)
+  nil)
+
+(defmacro with-tx
+  "Run `body` in a transaction bound to `tx-sym`: begin, evaluate the body, then
+  commit on normal completion (returning the body's value) or roll back if the body
+  throws (re-throwing). A commit conflict throws an `:igeldb/conflict` ex-info out of
+  `with-tx`; it is NOT auto-retried -- catch it to retry the whole transaction."
+  [[tx-sym kvs] & body]
+  `(let [~tx-sym (begin-tx ~kvs)]
+     (try
+       (let [result# (do ~@body)]
+         (commit-tx ~tx-sym)
+         result#)
+       (catch Throwable e#
+         (rollback-tx ~tx-sym)
+         (throw e#)))))
