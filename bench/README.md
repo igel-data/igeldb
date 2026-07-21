@@ -58,39 +58,45 @@ SQLite's *best* case, not a handicap.
 ## Sample results
 
 macOS, Apple silicon, SSD, SQLite 3.51.0, blossom 2.0.1, **with the Phase 4 sparse
-block index**. Numbers are ops/sec; `ratio` is IgelDB ÷ SQLite (higher is better
-for IgelDB).
+block index and the Phase 4.5 cached read channels**. Numbers are ops/sec; `ratio`
+is IgelDB ÷ SQLite (higher is better for IgelDB).
 
 **JVM 21**
 
 | phase | IgelDB | SQLite | ratio |
 |---|---:|---:|---:|
-| bulk load (1 txn) | 79,438 | 258,392 | 0.31× |
-| durable writes | 3,058 | 10,774 | 0.28× |
-| point reads (1 thread) | 22,772 | 37,487 | 0.61× |
-| point reads (8 threads) | 78,170 | 256,196 | 0.31× |
-| range scan (all keys) | 477,608 | 978,848 | 0.49× |
+| bulk load (1 txn) | 69,336 | 294,191 | 0.24× |
+| durable writes | 3,088 | 9,589 | 0.32× |
+| point reads (1 thread) | 28,550 | 37,209 | 0.77× |
+| point reads (8 threads) | 126,500 | 267,838 | 0.47× |
+| range scan (all keys) | 524,267 | 1,077,615 | 0.49× |
 
 **Babashka 1.12 (SCI)**
 
 | phase | IgelDB | SQLite | ratio |
 |---|---:|---:|---:|
-| bulk load (1 txn) | 11,028 | 301,040 | 0.04× |
-| durable writes | 2,642 | 10,432 | 0.25× |
-| point reads (1 thread) | 3,790 | 45,172 | 0.08× |
-| point reads (8 threads) | 22,563 | 262,501 | 0.09× |
-| range scan (all keys) | 17,605 | 1,183,513 | 0.01× |
+| bulk load (1 txn) | 10,708 | 260,159 | 0.04× |
+| durable writes | 2,643 | 9,204 | 0.29× |
+| point reads (1 thread) | 3,789 | 37,437 | 0.10× |
+| point reads (8 threads) | 23,497 | 271,757 | 0.09× |
+| range scan (all keys) | 16,526 | 1,133,818 | 0.01× |
 
 > **The SQLite 1-thread read row is mostly process startup.** `sqlite3` startup is
-> ~3.5 ms (measured and printed by the script); 200 reads at 37,487/s is 5.3 ms
+> ~3.5 ms (measured and printed by the script); 200 reads at 37,209/s is 5.4 ms
 > total, so most of it is spawning the process. Do **not** read that cell as
 > SQLite's read performance — the 8-thread row, which amortises startup over 1 000
-> reads per process, is the honest estimate (~256 k reads/s). The same caveat
-> flatters IgelDB's 0.61× on that row; **0.31× (8 threads) is the fair number.**
+> reads per process, is the honest estimate (~268 k reads/s). The same caveat
+> flatters IgelDB's 0.77× there; **0.47× (8 threads) is the fair number.**
+
+> **Run-to-run noise is real.** On a busy machine the write and scan phases swing
+> ±20 % (range scan was seen anywhere from 219 k to 524 k in back-to-back runs).
+> Treat single-run differences under ~1.3× in those phases as noise; the read
+> phases are far more stable.
 
 ## What the numbers say
 
-**Point reads used to be the weak spot (0.01×); the sparse block index fixed it.**
+**Point reads used to be the weak spot (0.01×). Two changes fixed it:** the Phase 4
+sparse block index, then the Phase 4.5 cached read channels.
 Before Phase 4, `io/read-value` linear-scanned the SSTable from the front for every
 key. It now binary-searches an in-memory sparse index to a block, seeks there, and
 scans only within that block:
@@ -102,30 +108,59 @@ scans only within that block:
 | point reads, 1 thread (bb) | 28 | 3,790 | **135×** |
 | point reads, 8 threads (bb) | 135 | 22,563 | **167×** |
 
-The ratio against SQLite moved from **0.01× to 0.31×** (8-thread, JVM) — from ~100×
-slower to ~3× slower. Latency is also no longer linear in key position: it is now
-bounded by where a key sits *within its block*, which is why a key at 99 % of the
-file can be cheaper to read than one at 75 %.
+bb gained far more than the JVM here (135–167× vs 36–51×) because the interpreter
+tax was concentrated in exactly the per-entry scanning the index eliminates.
 
-bb gains far more than the JVM (135–167× vs 36–51×) because the interpreter tax was
-concentrated in exactly the per-entry scanning work the index eliminates.
+Latency is also no longer linear in key position: it is bounded by where a key sits
+*within its block*, which is why a key at 99 % of the file can be cheaper to read
+than one at 75 %.
 
-**Writes and scans were untouched by Phase 4**, as expected — bulk load, durable
-writes and range scan all moved within noise. IgelDB now sits at roughly **0.3× of
-SQLite** across writes and reads on the JVM, which is a reasonable place for a
-pure-Clojure store against a mature C engine.
+**Phase 4.5 then removed the per-read `open()`.** Every read used to open and close
+the SSTable file (~19 µs, ~30 % of a point read, and a hard throughput ceiling: open
++ close tops out around 118 k/s at 8 threads, right where reads were landing). Reads
+now go through one cached `FileChannel` per table using absolute positional reads,
+which are safe for many concurrent readers:
+
+| | Phase 4 | + channel cache | |
+|---|---:|---:|---|
+| point reads, 1 thread (JVM) | 22,772 | 28,550 | 1.25× |
+| point reads, 8 threads (JVM) | 78,170 | 126,500 | **1.62×** |
+| point reads, 1 thread (bb) | 3,790 | 3,789 | 1.00× |
+| point reads, 8 threads (bb) | 22,563 | 23,497 | 1.04× |
+
+So the 8-thread ratio moved **0.31× → 0.47×**, and the whole journey is
+**0.01× → 0.47×**.
+
+**The cache is a JVM-only win, and that is expected.** Under SCI a point read costs
+~264 µs, so a 19 µs open is only ~7 % of it — removing it is lost in the
+interpreter's noise. On the JVM the same 19 µs is ~30 % of the read.
+
+One trap worth recording: the first version of the cache used a fixed 16 KB chunk
+and made single-threaded reads **20 % slower** (12,469 vs 15,569 ops/s) while still
+winning on concurrency — a point read only needs its ~4 KB block, so it was reading
+and allocating 4× more than necessary. Sizing the first channel read to the block
+extent (which the index already knows) turned that into a 1.25× gain. "Cache the
+handle" was not a pure win until the read was right-sized.
+
+**Neither phase touched writes or scans**, as expected — both are read-path only, and
+bulk load, durable writes and range scan all moved within run-to-run noise. On the
+JVM IgelDB now sits at roughly **0.24–0.32× of SQLite on writes** and **0.47× on
+concurrent reads**, which is a reasonable place for a pure-Clojure store against a
+mature C engine.
 
 **The remaining soft spot is the range scan under bb** (0.01×): scanning is pure
-per-entry interpretation, so it carries the full ~27× SCI tax and the index does not
-help (a scan reads every entry by definition).
+per-entry interpretation, so it carries the full ~32× SCI tax, and neither the index
+nor the channel cache can help — a scan reads every entry by definition, and its
+cost is interpretation, not file setup.
 
 ### Reads do scale with concurrency — but so do SQLite's
 
 IgelDB reads parallelise well (short read lock over an immutable version snapshot,
-so readers don't exclude each other): 22,772 → 78,170 on the JVM (3.4× on 8 threads)
-and 3,790 → 22,563 under bb (6.0×). SQLite scales similarly (37,487 → 256,196), so
-concurrency does not by itself change the ratio — measuring reads single-threaded
-reports latency, not throughput, which is why both are reported.
+so readers don't exclude each other): 28,550 → 126,500 on the JVM (4.4× on 8 threads,
+up from 3.4× before the channel cache removed the open ceiling) and 3,789 → 23,497
+under bb (6.2×). SQLite scales similarly, so concurrency does not by itself change
+the ratio — measuring reads single-threaded reports latency, not throughput, which
+is why both are reported.
 
 ### A latent scaling issue: the read lock is *fair*
 
@@ -141,10 +176,10 @@ empty body):
 | 8 | 4,421,831 | 0.16× |
 | 16 | 1,499,769 | **0.05×** |
 
-This is still **not** binding, but the index moved it a long way closer. Before
-Phase 4 the headroom was four orders of magnitude (1.5 M acq/s against ~2 300
-reads/s). Now IgelDB does 78 k reads/s on 8 threads against a lock that sustains
-~4.4 M acquires/s at that width — roughly **56× of headroom** rather than ~10 000×.
+This is still **not** binding, but each read-path improvement moves it closer.
+Before Phase 4 the headroom was four orders of magnitude (1.5 M acq/s against ~2 300
+reads/s). After the index it was ~56×. Now, at 126 k reads/s on 8 threads against a
+lock sustaining ~4.4 M acquires/s at that width, it is roughly **35×**.
 
 Each read takes exactly one `with-version` acquire, so the lock becomes the ceiling
 once read throughput approaches it. It is the next thing to look at if reads get
@@ -177,11 +212,11 @@ consulted*, so it compounds in multi-level stores and on negative lookups (138×
 
 | phase | JVM ÷ bb |
 |---|---:|
-| bulk load | 7.2× |
+| bulk load | 6.5× |
 | durable writes | **1.2×** |
-| point reads (1 thread) | 6.0× |
-| point reads (8 threads) | 3.5× |
-| range scan | **27.1×** |
+| point reads (1 thread) | 7.5× |
+| point reads (8 threads) | 5.4× |
+| range scan | **31.7×** |
 
 Durable writes barely move (1.2×) because that phase is fsync-bound — the
 interpreter is not on the critical path. The point-read tax *fell* (15.9× → 6.0×)
