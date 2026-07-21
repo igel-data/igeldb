@@ -6,7 +6,8 @@
             [igeldb.data :as data]
             [igeldb.io :as io]
             [igeldb.manifest :as manifest]
-            [igeldb.sstable :as sstable])
+            [igeldb.sstable :as sstable]
+            [igeldb.tx :as tx])
   (:import (java.io FileOutputStream BufferedOutputStream RandomAccessFile)))
 
 (defn- ->bytes [^String s] (.getBytes s))
@@ -122,6 +123,30 @@
 
 (defn- wal-id-of [file] (Long/parseLong (re-find #"\d+" (.getName file))))
 
+(defn- wait-until
+  [pred]
+  (let [deadline (+ (System/currentTimeMillis) 15000)]
+    (loop []
+      (cond
+        (pred) true
+        (> (System/currentTimeMillis) deadline) false
+        :else (do (Thread/sleep 10) (recur))))))
+
+(defn- tiny-config-path!
+  "A config whose memtable flushes on essentially every write (so a single write
+  lands in an SSTable and leaves the live WAL generation empty)."
+  [data-dir]
+  (rm-rf data-dir)
+  (.mkdirs (jio/file data-dir))
+  (let [config {:sstable-dir (str data-dir "/sstable")
+                :wal-dir (str data-dir "/wal")
+                :memtable-size 1
+                :sync-window-time 10}
+        path (str data-dir "/config.yaml")]
+    (with-open [w (jio/writer path)]
+      (.write w (yaml/generate-string config)))
+    path))
+
 ;; ---- Step 1-3/1-4: recovery with a stale (undeleted) WAL -----------------
 
 (deftest recovery-with-stale-wal-test
@@ -174,6 +199,40 @@
           "startup succeeds and committed data is intact")
       (is (nil? (igel/select kvs (->bytes "no-such-key"))))
       (igel/close! kvs))
+    (rm-rf data-dir)))
+
+;; ---- Step 7: next-seq recovery via the manifest max-seq ------------------
+
+(deftest next-seq-restored-from-manifest-after-empty-wal-flush-test
+  ;; A clean shutdown right after a flush leaves an EMPTY WAL: the newest seq lives
+  ;; only in an SSTable. next-seq must be recovered from the manifest's max-seq, not
+  ;; the empty WAL -- otherwise a restart would restart seqs at 0 and reuse them,
+  ;; corrupting version ordering / MVCC.
+  (let [data-dir "./test-data/manifest-max-seq"
+        config-path (tiny-config-path! data-dir)]
+    (let [kvs (igel/gen-kvs config-path)]
+      (igel/write! kvs (->bytes "k") (->bytes "v0"))
+      ;; wait until the write is durably flushed: its SSTable is committed to the
+      ;; version (so the manifest edit -- with max-seq -- is fsynced) and the live
+      ;; memtable is empty.
+      (is (wait-until #(and (zero? (deref (:size @(:memtable kvs))))
+                            (seq (first @(:current-version (:tree kvs))))))
+          "the write was flushed and its manifest edit committed")
+      (let [max-before (tx/current-seq (:registry kvs))]
+        (is (pos? max-before) "some seq was assigned")
+        (igel/close! kvs)
+        (let [kvs2 (igel/gen-kvs config-path)]
+          (is (= max-before (tx/current-seq (:registry kvs2)))
+              "next-seq restored from the manifest max-seq, not the empty WAL")
+          (is (b= (->bytes "v0") (igel/select kvs2 (->bytes "k")))
+              "the flushed value is recovered from the SSTable")
+          ;; a fresh write must get a strictly higher seq -- no collision with the
+          ;; already-committed SSTable version of the same key
+          (igel/write! kvs2 (->bytes "k") (->bytes "v1"))
+          (is (= (inc max-before) (tx/current-seq (:registry kvs2)))
+              "the next write advances past the recovered seq")
+          (is (b= (->bytes "v1") (igel/select kvs2 (->bytes "k"))))
+          (igel/close! kvs2))))
     (rm-rf data-dir)))
 
 ;; ---- Step 2: reads stay consistent across version swaps ------------------

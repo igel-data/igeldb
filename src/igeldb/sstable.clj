@@ -221,9 +221,12 @@
 
 (defn restore-tree-store
   "Rebuild the table set by replaying the manifest (no directory scan). Returns
-  `[tree next-sstable-id]`. Files on disk not referenced by the replayed state
-  are ignored. `next-sstable-id` is one past the highest ID ever assigned (from
-  any edit's `:added`) so a deleted table's ID is never reused."
+  `[tree next-sstable-id manifest-max-seq]`. Files on disk not referenced by the
+  replayed state are ignored. `next-sstable-id` is one past the highest ID ever
+  assigned (from any edit's `:added`) so a deleted table's ID is never reused.
+  `manifest-max-seq` is the highest InternalKey seq any edit committed -- part of
+  next-seq recovery (the newest seq may live only in SSTables after a clean
+  shutdown; see `igeldb.core/gen-kvs`)."
   [{:keys [sstable-dir] :as config}]
   (io/make-dir sstable-dir)
   (let [raw-edits (manifest/read-edits (manifest/manifest-path config))
@@ -231,10 +234,13 @@
         version (reduce apply-edit [[]] edits)
         max-id (reduce (fn [m e] (reduce (fn [m a] (max m (:id a))) m (:added e)))
                        -1 raw-edits)
+        manifest-max-seq (reduce (fn [m e] (max m (or (:max-seq e) 0))) 0 raw-edits)
         sstable-id (inc max-id)]
-    (logging/info "Restored table set from manifest; next SSTable id" sstable-id)
+    (logging/info "Restored table set from manifest; next SSTable id" sstable-id
+                  "manifest max-seq" manifest-max-seq)
     [(->TreeStore sstable-dir
                   (atom version)
                   (make-rw-lock)
                   (manifest/open-manifest config))
-     sstable-id]))
+     sstable-id
+     manifest-max-seq]))

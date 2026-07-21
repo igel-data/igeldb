@@ -1,7 +1,8 @@
 #!/usr/bin/env bb
 ;; Babashka smoke test: proves IgelDB's namespaces load under SCI and the durable
 ;; path works on bb -- write -> flush -> select -> scan -> compaction ->
-;; reopen(recovery) -> verify. It does NOT re-cover logic the JVM clojure.test
+;; reopen(recovery) -> verify, plus a transaction (with-tx commit + reopen) and a
+;; write-write conflict / rollback. It does NOT re-cover logic the JVM clojure.test
 ;; suite owns. Run from the repo root:
 ;;
 ;;   bb test/bb_smoke.clj
@@ -77,6 +78,39 @@
     (println "5. reopen from the same dir (manifest replay + WAL recovery)")
     (let [kvs (igel/gen-kvs config-path)]
       (check "all keys intact after reopen" (all-readable? kvs))
+      (igel/close! kvs))
+    (println "6. transaction: with-tx commits several keys atomically")
+    (let [kvs (igel/gen-kvs config-path)]
+      (igel/with-tx [tx kvs]
+        (igel/tx-put tx (->bytes "tx-a") (->bytes "A"))
+        (igel/tx-put tx (->bytes "tx-b") (->bytes "B"))
+        (igel/tx-put tx (->bytes "tx-c") (->bytes "C")))
+      (check "committed tx keys are visible"
+             (and (v= "A" (igel/select kvs (->bytes "tx-a")))
+                  (v= "B" (igel/select kvs (->bytes "tx-b")))
+                  (v= "C" (igel/select kvs (->bytes "tx-c")))))
+      (igel/close! kvs))
+    (println "7. reopen: committed tx keys are durable")
+    (let [kvs (igel/gen-kvs config-path)]
+      (check "tx keys survive reopen"
+             (and (v= "A" (igel/select kvs (->bytes "tx-a")))
+                  (v= "C" (igel/select kvs (->bytes "tx-c")))))
+      (println "8. write-write conflict (first-committer-wins) + rollback")
+      (let [t (igel/begin-tx kvs)]
+        (igel/tx-get t (->bytes "tx-a"))              ;; read at the tx's snapshot
+        (igel/write! kvs (->bytes "tx-a") (->bytes "A2")) ;; another commit advances it
+        (igel/tx-put t (->bytes "tx-a") (->bytes "A3"))
+        (let [conflict? (try (igel/commit-tx t) false
+                             (catch clojure.lang.ExceptionInfo e
+                               (boolean (:igeldb/conflict (ex-data e)))))]
+          (check "stale tx conflicts on commit" conflict?)
+          (check "conflicting tx's write was discarded"
+                 (v= "A2" (igel/select kvs (->bytes "tx-a"))))))
+      (let [t (igel/begin-tx kvs)]
+        (igel/tx-put t (->bytes "tx-a") (->bytes "NOPE"))
+        (igel/rollback-tx t)
+        (check "rolled-back write is not visible"
+               (v= "A2" (igel/select kvs (->bytes "tx-a")))))
       (igel/close! kvs))))
 
 (try

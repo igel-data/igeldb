@@ -47,6 +47,8 @@
 ;;                      long bloomLen, bytes bloom
 ;;   long   deletedCount
 ;;   repeat deletedCount: long id
+;;   long   maxSeq        ;; highest InternalKey seq committed by this edit (Point 1
+;;                        ;; recovery: next-seq = max(manifest maxSeq, WAL maxSeq)+1)
 
 (defn- write-bytes-field!
   [^DataOutputStream out ^bytes b]
@@ -60,7 +62,7 @@
     buf))
 
 (defn- edit->bytes
-  [{:keys [added deleted]}]
+  [{:keys [added deleted max-seq]}]
   (let [baos (ByteArrayOutputStream.)
         out (DataOutputStream. baos)]
     (.writeLong out (count added))
@@ -74,6 +76,7 @@
     (.writeLong out (count deleted))
     (doseq [id deleted]
       (.writeLong out id))
+    (.writeLong out (or max-seq 0))
     (.flush out)
     (.toByteArray baos)))
 
@@ -93,8 +96,9 @@
                          :bloom-filter bloom-filter}))
                     (range (.readLong in)))
         deleted (mapv (fn [_] (.readLong in))
-                      (range (.readLong in)))]
-    {:added added :deleted deleted}))
+                      (range (.readLong in)))
+        max-seq (.readLong in)]
+    {:added added :deleted deleted :max-seq max-seq}))
 
 (defn read-edits
   "Replay every committed edit from the manifest, in append order. Reuses the

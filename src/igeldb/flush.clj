@@ -35,7 +35,11 @@
         entry-set (memtable/entry-set memtable)
         ;; entries are [ikey data] in InternalKey order; head/tail are user_keys
         head-key (:user-key (first (first entry-set)))
-        tail-key (:user-key (first (last entry-set)))]
+        tail-key (:user-key (first (last entry-set)))
+        ;; highest seq flushed -- carried into the manifest edit for next-seq
+        ;; recovery (a clean shutdown after a flush leaves an empty WAL, so the
+        ;; newest seq can live only in SSTables). Ignored by per-table encoding.
+        max-seq (reduce (fn [m [ikey _]] (max m (:seq ikey))) 0 entry-set)]
     (logging/info "Starting flush to SSTable" sstable-path)
     (with-open [file-stream (FileOutputStream. sstable-path)
                 out-stream (BufferedOutputStream. file-stream 16384)]
@@ -45,7 +49,7 @@
       (.flush out-stream)
       (-> file-stream .getChannel (.force true)))
     {:id new-id :level 0 :head-key head-key :tail-key tail-key
-     :bloom-filter bf :size (.length (File. sstable-path))}))
+     :bloom-filter bf :size (.length (File. sstable-path)) :max-seq max-seq}))
 
 (defn- flush!
   "Commit the current memtable to an SSTable (when it holds data) and rotate the
@@ -73,7 +77,8 @@
       ;; (higher-id) WAL as the newest; recovery replays only the newest and
       ;; discards the old WAL, whose data lives only in the un-committed (orphan,
       ;; therefore ignored) SSTable -> data loss.
-      (sstable/commit-edit! tree {:added [entry] :deleted []})
+      (sstable/commit-edit! tree {:added [entry] :deleted []
+                                  :max-seq (:max-seq entry)})
       ;; The flushed data now lives in a committed version; drop the immutable
       ;; memtable reference. Reads fall through mutable -> version with no gap:
       ;; before this reset the data is in both the immutable memtable and the

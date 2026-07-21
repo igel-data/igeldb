@@ -300,12 +300,16 @@
 (defn gen-kvs
   [config-path]
   (let [config (config/load-config config-path)
-        [tree sstable-id] (restore-tree-store config)
+        [tree sstable-id manifest-max-seq] (restore-tree-store config)
         ;; global commit-order / MVCC state (shared across memtable generations):
         ;; the seq counter + the active-tx snapshot set. init-memtable seeds the
-        ;; counter from the replayed WAL's max seq.
+        ;; counter from the replayed WAL's max seq; then fold in the manifest's
+        ;; max-seq so next-seq = max(manifest max-seq, WAL max-seq) + 1. The manifest
+        ;; part is essential: a clean shutdown right after a flush leaves an empty
+        ;; WAL, so the newest seq can live only in SSTables.
         registry (tx/create-registry)
         [wal-id memtable-val] (init-memtable (async/chan) registry config)
+        _ (tx/seed-seq! registry (max manifest-max-seq (tx/current-seq registry)))
         memtable (atom memtable-val)
         ;; Holds the memtable currently being flushed (nil when no flush is in
         ;; progress). Reads consult it between the mutable memtable and the

@@ -268,12 +268,18 @@
             paths (map #(sstable/get-sstable-path (first %) dir)
                        (:inputs-low-to-high plan))
             merged (merge-inputs paths floor (:drop-tombstones? plan))
+            ;; highest seq in the compaction output, for next-seq recovery. Realizes
+            ;; `merged` (already backed by an in-memory map); the cached seq is then
+            ;; streamed by write-output!. Compaction preserves seqs, so this never
+            ;; exceeds a prior flush edit's max-seq, but recording it is harmless.
+            max-seq (reduce (fn [m [ikey _]] (max m (:seq ikey))) 0 merged)
             out-entries (write-output! merged (:out-level plan) sstable-id config)]
         (logging/info "Compaction L" (:level plan) "-> L" (:out-level plan)
                       ":" (count (:deleted-ids plan)) "inputs ->"
                       (count out-entries) "outputs")
         (sstable/commit-edit! tree {:added out-entries
-                                    :deleted (:deleted-ids plan)})
+                                    :deleted (:deleted-ids plan)
+                                    :max-seq max-seq})
         (when-let [ptr (:pointer plan)]
           (swap! compact-pointers assoc (:level plan) ptr))
         ;; The version no longer references the inputs; delete their files under
