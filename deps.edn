@@ -4,7 +4,12 @@
         clj-commons/clj-yaml {:mvn/version "1.0.27"}
         blossom/blossom {:mvn/version "2.0.1"}}
 
- :aliases {:test {:extra-paths ["test"]
+ :aliases {;; Run the IgelDB-vs-SQLite benchmark on the JVM. The same script runs
+           ;; under Babashka via `bb bench/bench.clj`; comparing the two shows the
+           ;; SCI interpretation overhead.
+           :bench {:main-opts ["bench/bench.clj"]}
+
+           :test {:extra-paths ["test"]
                   :extra-deps {io.github.cognitect-labs/test-runner
                                {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
                   :exec-fn cognitect.test-runner.api/test}}}

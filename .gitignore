@@ -3,6 +3,7 @@
 /checkouts
 /data
 /test-data
+/bench-data
 /.cpcache
 profiles.clj
 pom.xml
