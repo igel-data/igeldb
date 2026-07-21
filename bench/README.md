@@ -44,11 +44,11 @@ include SQL text parsing per statement plus one process start.
 | 5 | Range scan | `scan` over all keys | `SELECT sum(length(v)) … WHERE k BETWEEN …` |
 
 Reads are measured **both** ways because they answer different questions: one
-thread gives per-op latency (the lens that exposes the linear scan), 8 threads
-gives throughput (what a server actually sees). Phase 4 gives the two engines
-*different op counts* on purpose — IgelDB 800 reads, SQLite 8 000 — because SQLite
-is ~100× faster per read and each of its readers is a separate process paying
-~4 ms of startup. Throughput in ops/sec is comparable regardless of op count.
+thread gives per-op latency, 8 threads gives throughput (what a server actually
+sees). Phase 4 gives the two engines *different op counts* on purpose — IgelDB 800
+reads, SQLite 8 000 — because SQLite is still ~10× faster per read and each of its
+readers is a separate process paying ~3.5 ms of startup, which needs more work to
+amortise. Throughput in ops/sec is comparable regardless of op count.
 
 Phase 2 gives IgelDB 32 writers and SQLite 1 deliberately. Group commit coalesces
 concurrent writers into shared fsyncs, so IgelDB's durable throughput scales with
@@ -57,77 +57,75 @@ SQLite's *best* case, not a handicap.
 
 ## Sample results
 
-macOS, Apple silicon, SSD, SQLite 3.51.0, blossom 2.0.1. Numbers are ops/sec;
-`ratio` is IgelDB ÷ SQLite (higher is better for IgelDB).
+macOS, Apple silicon, SSD, SQLite 3.51.0, blossom 2.0.1, **with the Phase 4 sparse
+block index**. Numbers are ops/sec; `ratio` is IgelDB ÷ SQLite (higher is better
+for IgelDB).
 
 **JVM 21**
 
 | phase | IgelDB | SQLite | ratio |
 |---|---:|---:|---:|
-| bulk load (1 txn) | 72,333 | 206,347 | 0.35× |
-| durable writes | 3,189 | 11,338 | 0.28× |
-| point reads (1 thread) | 444 | 38,128 | 0.01× |
-| point reads (8 threads) | 2,249 | 262,532 | 0.01× |
-| range scan (all keys) | 400,032 | 982,623 | 0.41× |
+| bulk load (1 txn) | 79,438 | 258,392 | 0.31× |
+| durable writes | 3,058 | 10,774 | 0.28× |
+| point reads (1 thread) | 22,772 | 37,487 | 0.61× |
+| point reads (8 threads) | 78,170 | 256,196 | 0.31× |
+| range scan (all keys) | 477,608 | 978,848 | 0.49× |
 
 **Babashka 1.12 (SCI)**
 
 | phase | IgelDB | SQLite | ratio |
 |---|---:|---:|---:|
-| bulk load (1 txn) | 11,206 | 298,380 | 0.04× |
-| durable writes | 2,703 | 10,873 | 0.25× |
-| point reads (1 thread) | 28 | 42,486 | 0.00× |
-| point reads (8 threads) | 150 | 258,950 | 0.00× |
-| range scan (all keys) | 16,773 | 1,273,250 | 0.01× |
+| bulk load (1 txn) | 11,028 | 301,040 | 0.04× |
+| durable writes | 2,642 | 10,432 | 0.25× |
+| point reads (1 thread) | 3,790 | 45,172 | 0.08× |
+| point reads (8 threads) | 22,563 | 262,501 | 0.09× |
+| range scan (all keys) | 17,605 | 1,183,513 | 0.01× |
 
-> **The SQLite 1-thread read row is ~85 % process startup.** `sqlite3` startup is
-> ~3.9 ms (measured and printed by the script); 200 reads at 38,128/s is 5.2 ms
-> total, so almost all of it is spawning the process. Do **not** read that cell as
+> **The SQLite 1-thread read row is mostly process startup.** `sqlite3` startup is
+> ~3.5 ms (measured and printed by the script); 200 reads at 37,487/s is 5.3 ms
+> total, so most of it is spawning the process. Do **not** read that cell as
 > SQLite's read performance — the 8-thread row, which amortises startup over 1 000
-> reads per process, is the honest estimate (~262 k reads/s).
+> reads per process, is the honest estimate (~256 k reads/s). The same caveat
+> flatters IgelDB's 0.61× on that row; **0.31× (8 threads) is the fair number.**
 
 ## What the numbers say
 
-**Point reads are IgelDB's weak spot, by a wide margin (~0.01×).** This is
-architectural, not harness noise. Profiling the read path (JVM, 5 000 entries in
-one SSTable) attributes essentially all of it to one thing:
+**Point reads used to be the weak spot (0.01×); the sparse block index fixed it.**
+Before Phase 4, `io/read-value` linear-scanned the SSTable from the front for every
+key. It now binary-searches an in-memory sparse index to a block, seeks there, and
+scans only within that block:
 
-| component of a point read | µs |
-|---|---:|
-| `blossom/hit?` (bloom check) | 1.6 |
-| `with-version` (rw read-lock) | 0.1 |
-| memtable lookup | 0.2 |
-| open the SSTable file | 13.3 |
-| **`io/read-value` for a mid-table key** | **2,722.9** |
+| phase | before index | after index | speedup |
+|---|---:|---:|---:|
+| point reads, 1 thread (JVM) | 444 | 22,772 | **51×** |
+| point reads, 8 threads (JVM) | 2,179 | 78,170 | **36×** |
+| point reads, 1 thread (bb) | 28 | 3,790 | **135×** |
+| point reads, 8 threads (bb) | 135 | 22,563 | **167×** |
 
-An SSTable carries **no block index**, so `io/read-value` scans the table file
-linearly for every key — reading *and CRC-verifying the 100-byte value of every
-entry it skips*, when it only needs the keys to compare. Latency is linear in the
-key's position: 0.34 ms at the front of the table, 5.07 ms at the back (≈0.93 µs
-per entry skipped). That scan is **~98 % of a mid-table read**. SQLite's B-tree
-does a logarithmic descent instead.
+The ratio against SQLite moved from **0.01× to 0.31×** (8-thread, JVM) — from ~100×
+slower to ~3× slower. Latency is also no longer linear in key position: it is now
+bounded by where a key sits *within its block*, which is why a key at 99 % of the
+file can be cheaper to read than one at 75 %.
 
-Adding a sparse block index (or at minimum, skipping the value segment while
-scanning) is the single highest-value optimisation available.
+bb gains far more than the JVM (135–167× vs 36–51×) because the interpreter tax was
+concentrated in exactly the per-entry scanning work the index eliminates.
+
+**Writes and scans were untouched by Phase 4**, as expected — bulk load, durable
+writes and range scan all moved within noise. IgelDB now sits at roughly **0.3× of
+SQLite** across writes and reads on the JVM, which is a reasonable place for a
+pure-Clojure store against a mature C engine.
+
+**The remaining soft spot is the range scan under bb** (0.01×): scanning is pure
+per-entry interpretation, so it carries the full ~27× SCI tax and the index does not
+help (a scan reads every entry by definition).
 
 ### Reads do scale with concurrency — but so do SQLite's
 
-IgelDB reads parallelise well (short read lock over an immutable version
-snapshot, so readers don't exclude each other). On a 12-core machine, 5 000
-entries:
-
-| threads | reads/sec | speedup |
-|---:|---:|---:|
-| 1 | 363 | 1.00× |
-| 2 | 738 | 2.03× |
-| 4 | 1,195 | 3.29× |
-| 8 | 2,087 | 5.75× |
-| 16 | 2,256 | 6.21× |
-
-So a single-threaded read number is latency, not throughput — measuring only that
-understates IgelDB by ~5–6×. But the **ratio is unchanged (0.01×)**, because
-SQLite parallelises just as well (40,937 → 262,532, 6.3×). Concurrency does not
-narrow the gap; only the block index will.
+IgelDB reads parallelise well (short read lock over an immutable version snapshot,
+so readers don't exclude each other): 22,772 → 78,170 on the JVM (3.4× on 8 threads)
+and 3,790 → 22,563 under bb (6.0×). SQLite scales similarly (37,487 → 256,196), so
+concurrency does not by itself change the ratio — measuring reads single-threaded
+reports latency, not throughput, which is why both are reported.
 
 ### A latent scaling issue: the read lock is *fair*
 
@@ -143,10 +141,16 @@ empty body):
 | 8 | 4,421,831 | 0.16× |
 | 16 | 1,499,769 | **0.05×** |
 
-This is **not** binding today — 1.5 M acq/s against ~2 300 actual reads/s is four
-orders of magnitude of headroom. But if the block index lands and reads drop to
-~15 µs, 16 threads would want ~1.07 M reads/s, which is the same order as that
-ceiling. Worth revisiting as a follow-on to the index work, not before.
+This is still **not** binding, but the index moved it a long way closer. Before
+Phase 4 the headroom was four orders of magnitude (1.5 M acq/s against ~2 300
+reads/s). Now IgelDB does 78 k reads/s on 8 threads against a lock that sustains
+~4.4 M acquires/s at that width — roughly **56× of headroom** rather than ~10 000×.
+
+Each read takes exactly one `with-version` acquire, so the lock becomes the ceiling
+once read throughput approaches it. It is the next thing to look at if reads get
+materially faster again (a file-handle cache or mmap would do that), and switching
+to a non-fair lock would need another answer for writer starvation — the reason
+fairness was chosen.
 
 ### A fixed per-read tax that used to be here (fixed in blossom 2.0.1)
 
@@ -163,30 +167,30 @@ reflectively — ~93 µs per hash × 3 hashes. blossom 2.0.1 adds the missing
 | `select` of key #0 (first entry) | 352.5 µs | 25.1 µs | 14× |
 | `select` of key #2500 (mid table) | 2,688.6 µs | 2,774.8 µs | unchanged |
 
-Note the last row: this benchmark barely moved (363 → 387 reads/s) because it uses
-a **single** SSTable and random keys, so the scan dwarfs the bloom check. The fix
-matters most where this benchmark is weakest — **negative lookups** (138×) and
-**multi-level stores**, where `sstable/select` pays the bloom check once *per
-SSTable consulted*. Treat the point-read row as a measure of the linear scan, not
-of bloom performance.
+Note the last row: at the time, the benchmark barely moved (363 → 387 reads/s),
+because with a **single** SSTable and random keys the linear scan dwarfed the bloom
+check. Phase 4 removed that scan, so the bloom fix now shows: it is ~1.6 µs of a
+~44 µs read rather than ~300 µs of a ~2 700 µs one, and it is paid once *per SSTable
+consulted*, so it compounds in multi-level stores and on negative lookups (138×).
 
 **The interpreter tax is very uneven** — this is the main reason to run both:
 
 | phase | JVM ÷ bb |
 |---|---:|
-| bulk load | 6.5× |
+| bulk load | 7.2× |
 | durable writes | **1.2×** |
-| point reads (1 thread) | 15.9× |
-| point reads (8 threads) | 15.0× |
-| range scan | 23.9× |
+| point reads (1 thread) | 6.0× |
+| point reads (8 threads) | 3.5× |
+| range scan | **27.1×** |
 
 Durable writes barely move (1.2×) because that phase is fsync-bound — the
-interpreter is not on the critical path. CPU-bound phases degrade 7–30×. So
-Babashka is a perfectly reasonable place to run *write-heavy, fsync-bound*
-IgelDB workloads, and a poor one for scan- or read-heavy work.
+interpreter is not on the critical path. The point-read tax *fell* (15.9× → 6.0×)
+because the index removed most of the interpreted per-entry work; what remains is
+mostly file I/O and one small block scan. Range scan keeps the full ~27× tax, since
+a scan reads every entry by definition and the index cannot help it.
 
-**Writes are within the same order of magnitude** (0.25–0.30×) against a mature
-C engine, which is a reasonable place for a pure-Clojure store to be.
+So Babashka is a reasonable place to run write-heavy fsync-bound workloads and now
+point-read workloads too; it remains a poor one for scan-heavy work.
 
 ## Caveats
 
