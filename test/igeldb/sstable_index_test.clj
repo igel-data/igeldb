@@ -8,7 +8,9 @@
             [igeldb.data :as data]
             [igeldb.io :as io]
             [igeldb.sstable :as sstable])
-  (:import (java.io RandomAccessFile)))
+  (:import (java.io RandomAccessFile)
+           (java.nio.channels FileChannel)
+           (java.nio.file Paths OpenOption StandardOpenOption)))
 
 (defn- ->bytes [^String s] (.getBytes s))
 (defn- b= [a b] (data/byte-array-equals? a b))
@@ -21,6 +23,22 @@
   (.delete file))
 
 (defn- rm-rf [dir] (delete-recursively! (jio/file dir)))
+
+(defn- open-ch
+  ^FileChannel [path]
+  (FileChannel/open (Paths/get (str path) (into-array String []))
+                    (into-array OpenOption [StandardOpenOption/READ])))
+
+;; Reads now take a cached channel. These wrappers keep the old argument shape and
+;; open a one-shot channel, so the tests stay about the index rather than plumbing.
+(defn- read-value* [path key snapshot table]
+  (with-open [ch (open-ch path)] (io/read-value ch path key snapshot table)))
+
+(defn- read-latest-seq* [path key table]
+  (with-open [ch (open-ch path)] (io/read-latest-seq ch path key table)))
+
+(defn- scan-pairs* [path from to snapshot table]
+  (with-open [ch (open-ch path)] (io/scan-pairs ch path from to snapshot table)))
 
 (defn- config [dir block-size]
   {:sstable-dir dir :bloom-filter {:size 10240} :sstable-block-size block-size})
@@ -49,8 +67,10 @@
   ;; The index is keyed by user_key; a lookup must land on the block whose first
   ;; user_key is the largest one <= target, then scan forward from there.
   (let [index [[(->bytes "c") 100] [(->bytes "f") 200] [(->bytes "m") 300]]]
-    (testing "target before every block -> start at the first entry (offset 1)"
-      (is (= 1 (io/floor-block-offset index (->bytes "a")))))
+    (testing "target before every block -> start at the FIRST block"
+      ;; nothing can precede block 0 (it begins at the first entry), so its offset
+      ;; is the authoritative start; the scan then immediately sees user_key > target
+      (is (= 100 (io/floor-block-offset index (->bytes "a")))))
     (testing "exact match on a block's first key -> that block"
       (is (= 100 (io/floor-block-offset index (->bytes "c"))))
       (is (= 300 (io/floor-block-offset index (->bytes "m")))))
@@ -75,13 +95,13 @@
           (str "expected many blocks, got " (count (:index table))))
       (testing "every key reads back correctly through the index"
         (doseq [i (range n)]
-          (let [d (io/read-value (:path table) (->bytes (format "key%05d" i))
-                                 Long/MAX_VALUE table)]
+          (let [d (read-value* (:path table) (->bytes (format "key%05d" i))
+                               Long/MAX_VALUE table)]
             (is (some? d) (str "missing key" i))
             (is (= (str "v" i (apply str (repeat 90 \x))) (s-of (:value d)))))))
       (testing "absent keys return nil (before, between and after the key range)"
         (doseq [k ["aaa" "key00000x" "zzz"]]
-          (is (nil? (io/read-value (:path table) (->bytes k) Long/MAX_VALUE table))))))
+          (is (nil? (read-value* (:path table) (->bytes k) Long/MAX_VALUE table))))))
     (rm-rf dir)))
 
 (deftest single-block-table-reads-correctly-test
@@ -92,8 +112,8 @@
     (let [table (write-table! dir 0 (* 1024 1024) (kv-entries 10))]
       (is (= 1 (count (:index table))) "one block")
       (doseq [i (range 10)]
-        (is (some? (io/read-value (:path table) (->bytes (format "key%05d" i))
-                                  Long/MAX_VALUE table)))))
+        (is (some? (read-value* (:path table) (->bytes (format "key%05d" i))
+                                Long/MAX_VALUE table)))))
     (rm-rf dir)))
 
 ;; ---- the straddle rule ---------------------------------------------------
@@ -131,21 +151,21 @@
                                [(->bytes "hot") (entry-offset entries 100)]
                                [(->bytes "zzz") (entry-offset entries 201)]])]
       (testing "a key split across blocks resolves to its NEWEST version"
-        (is (= "v200" (s-of (:value (io/read-value (:path split) (->bytes "hot")
-                                                   Long/MAX_VALUE split))))
+        (is (= "v200" (s-of (:value (read-value* (:path split) (->bytes "hot")
+                                                 Long/MAX_VALUE split))))
             "entered a later block and skipped the newest versions"))
       (testing "snapshots in the later block half still resolve correctly"
         (doseq [snap [1 50 101 150 200]]
           (is (= (str "v" snap)
-                 (s-of (:value (io/read-value (:path split) (->bytes "hot")
-                                              snap split)))))))
+                 (s-of (:value (read-value* (:path split) (->bytes "hot")
+                                            snap split)))))))
       (testing "neighbours of the split key are unaffected"
-        (is (= "before" (s-of (:value (io/read-value (:path split) (->bytes "aaa")
-                                                     Long/MAX_VALUE split)))))
-        (is (= "after" (s-of (:value (io/read-value (:path split) (->bytes "zzz")
-                                                    Long/MAX_VALUE split))))))
+        (is (= "before" (s-of (:value (read-value* (:path split) (->bytes "aaa")
+                                                   Long/MAX_VALUE split)))))
+        (is (= "after" (s-of (:value (read-value* (:path split) (->bytes "zzz")
+                                                  Long/MAX_VALUE split))))))
       (testing "latest-seq also enters at the first block of the split run"
-        (is (= 200 (io/read-latest-seq (:path split) (->bytes "hot") split)))))
+        (is (= 200 (read-latest-seq* (:path split) (->bytes "hot") split)))))
     (rm-rf dir)))
 
 (deftest many-versions-of-one-key-are-read-correctly-test
@@ -163,23 +183,23 @@
       (testing "the writer keeps one user_key's versions together"
         (is (= ["aaa" "zzz"] (mapv (comp s-of first) (:index table)))))
       (testing "the newest version is found"
-        (is (= "v200" (s-of (:value (io/read-value (:path table) (->bytes "hot")
-                                                   Long/MAX_VALUE table))))))
+        (is (= "v200" (s-of (:value (read-value* (:path table) (->bytes "hot")
+                                                 Long/MAX_VALUE table))))))
       (testing "every snapshot resolves to its newest visible version"
         (doseq [snap [1 2 37 99 150 200]]
           (is (= (str "v" snap)
-                 (s-of (:value (io/read-value (:path table) (->bytes "hot")
-                                              snap table))))
+                 (s-of (:value (read-value* (:path table) (->bytes "hot")
+                                            snap table))))
               (str "snapshot " snap))))
       (testing "a snapshot older than every version sees nothing"
-        (is (nil? (io/read-value (:path table) (->bytes "hot") 0 table))))
+        (is (nil? (read-value* (:path table) (->bytes "hot") 0 table))))
       (testing "keys on either side of the straddling key are unaffected"
-        (is (= "before" (s-of (:value (io/read-value (:path table) (->bytes "aaa")
-                                                     Long/MAX_VALUE table)))))
-        (is (= "after" (s-of (:value (io/read-value (:path table) (->bytes "zzz")
-                                                    Long/MAX_VALUE table))))))
+        (is (= "before" (s-of (:value (read-value* (:path table) (->bytes "aaa")
+                                                   Long/MAX_VALUE table)))))
+        (is (= "after" (s-of (:value (read-value* (:path table) (->bytes "zzz")
+                                                  Long/MAX_VALUE table))))))
       (testing "latest-seq walks the same straddling run"
-        (is (= 200 (io/read-latest-seq (:path table) (->bytes "hot") table)))))
+        (is (= 200 (read-latest-seq* (:path table) (->bytes "hot") table)))))
     (rm-rf dir)))
 
 ;; ---- reads touch only their block ---------------------------------------
@@ -195,8 +215,8 @@
           entries-read (fn [key]
                          (let [c (atom 0)]
                            (binding [io/*entries-read* c]
-                             (io/read-value (:path table) (->bytes key)
-                                            Long/MAX_VALUE table))
+                             (read-value* (:path table) (->bytes key)
+                                          Long/MAX_VALUE table))
                            @c))
           first-key (entries-read (format "key%05d" 0))
           last-key (entries-read (format "key%05d" (dec n)))]
@@ -219,8 +239,8 @@
           table (write-table! dir 0 256 (kv-entries n))
           scan (fn [from to]
                  (mapv (comp s-of first)
-                       (io/scan-pairs (:path table) (->bytes from) (->bytes to)
-                                      Long/MAX_VALUE table)))
+                       (scan-pairs* (:path table) (->bytes from) (->bytes to)
+                                    Long/MAX_VALUE table)))
           k #(format "key%05d" %)]
       (testing "a full scan returns every key in order"
         (is (= (mapv k (range n)) (scan (k 0) "key99999"))))

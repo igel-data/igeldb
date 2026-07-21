@@ -3,8 +3,11 @@
             [igeldb.data :as data])
   (:import (java.io BufferedInputStream
                     BufferedOutputStream
+                    ByteArrayInputStream
                     ByteArrayOutputStream)
            (java.nio ByteBuffer)
+           (java.nio.channels FileChannel)
+           (java.nio.file Paths OpenOption StandardOpenOption)
            (java.util.zip CRC32)))
 
 (defn serialize-long
@@ -125,7 +128,7 @@
     :corrupt    - the whole segment was read but its CRC did not match, or the
                   length prefix is nonsensical (mid-file corruption)
     {:ok bytes} - a valid data segment"
-  [^BufferedInputStream in-stream]
+  [^java.io.InputStream in-stream]
   (let [len-buf (make-array Byte/TYPE LEN_SIZE)
         len-read (.readNBytes in-stream len-buf 0 LEN_SIZE)]
     (cond
@@ -169,7 +172,7 @@
     :truncated   - an incomplete entry at the tail
     :corrupt     - a CRC mismatch (mid-file corruption)
     [ikey data]  - a complete entry; `ikey` is an InternalKey, `data` a `Data`"
-  [^BufferedInputStream in-stream]
+  [^java.io.InputStream in-stream]
   (let [k (read-data! in-stream)]
     (if (map? k)
       (let [v (read-data! in-stream)]
@@ -195,6 +198,64 @@
     (when-not (= b SSTABLE_FORMAT_VERSION)
       (throw (ex-info "Unsupported or corrupt SSTable format"
                       {:file (str file-path) :format-byte b})))))
+
+;; ---- channel-backed entry reads (Phase 4.5) ------------------------------
+;;
+;; Reads go through a cached `FileChannel` using ABSOLUTE positional reads
+;; (`read(ByteBuffer, position)`), which are safe for many concurrent readers on a
+;; single channel and never disturb a shared file position. That removes the
+;; per-read open()/close(): ~19us, roughly 30% of a point read, and a throughput
+;; ceiling under concurrency. Verified bb-safe.
+;;
+;; Entries are parsed from in-memory chunks pulled off the channel, so the
+;; framing/CRC/corruption logic is reused untouched.
+
+(def ^:private ^:const READ_CHUNK 16384)
+
+(defn- read-at!
+  "Read up to `n` bytes at absolute position `pos`. Shorter than `n` only at EOF."
+  ^bytes [^FileChannel ch ^long pos ^long n]
+  (let [buf (ByteBuffer/allocate n)]
+    (loop [p pos]
+      (if (.hasRemaining buf)
+        (let [got (.read ch buf p)]
+          (if (neg? got)
+            (java.util.Arrays/copyOf (.array buf) (.position buf))
+            (recur (+ p got))))
+        (.array buf)))))
+
+(defn- entry-seq
+  "A lazy seq of `[pos [ikey data]]` from `start` up to `limit` (where the entries
+  region ends), read from `ch` in chunks. Lazy per entry, so a point read parses
+  only what it consumes rather than a whole chunk.
+
+  A chunk boundary landing mid-entry is NOT corruption: the reader refills from the
+  start of that incomplete entry, doubling the chunk so an oversized entry always
+  eventually fits. A CRC mismatch IS corruption and raises."
+  [^FileChannel ch start limit file-path first-chunk]
+  (letfn [(corrupt! [reason]
+            (throw (ex-info "SSTable is corrupted"
+                            {:file (str file-path) :reason reason})))
+          (refill [pos want]
+            (when (< (long pos) (long limit))
+              (let [n (min (long want) (- (long limit) (long pos)))
+                    bytes (read-at! ch pos n)]
+                (walk pos (ByteArrayInputStream. bytes)
+                      (+ pos (alength bytes)) want))))
+          (walk [pos in chunk-end want]
+            (lazy-seq
+             (when (< (long pos) (long limit))
+               (let [e (read-kv-pair! in)]
+                 (cond
+                   (vector? e)
+                   (cons [pos e]
+                         (walk (+ pos (entry-size-on-disk (first e) (second e)))
+                               in chunk-end want))
+                   (= :corrupt e) (corrupt! e)
+                    ;; chunk ran out mid-entry -> refill from this entry's start
+                   (< (long chunk-end) (long limit)) (refill pos (* 2 (long want)))
+                   :else (corrupt! e))))))]
+    (refill start (max 512 (min (long first-chunk) READ_CHUNK)))))
 
 ;; ---- SSTable footer: sparse block index + trailer (format v3) -------------
 ;;
@@ -304,33 +365,24 @@
 (defn read-all-entries
   "Every [ikey data] entry of an SSTable, in file order (compaction reads whole
   tables). Bounded by the entries region -- reading to EOF would run into the
-  index/trailer footer and misparse it as entries."
+  index/trailer footer and misparse it as entries. Opens its own channel: a
+  compaction reads each input exactly once, so it bypasses the read cache."
   [file-path]
   (let [{:keys [index-start]} (read-footer! file-path)]
-    (with-open [in (io/input-stream file-path)]
-      (read-format-byte! in file-path)
-      (loop [pos 1 acc (transient [])]
-        (if (>= pos index-start)
-          (persistent! acc)
-          (let [entry (read-kv-pair! in)]
-            (cond
-              (= :eof entry) (persistent! acc)
-              (or (= :truncated entry) (= :corrupt entry))
-              (throw (ex-info "SSTable is corrupted (compaction input)"
-                              {:file (str file-path) :reason entry}))
-              :else (let [[ikey data] entry]
-                      (recur (+ pos (entry-size-on-disk ikey data))
-                             (conj! acc entry))))))))))
+    (with-open [ch (FileChannel/open
+                    (Paths/get (str file-path) (into-array String []))
+                    (into-array OpenOption [StandardOpenOption/READ]))]
+      (mapv second (entry-seq ch 1 index-start file-path READ_CHUNK)))))
 
-(defn floor-block-offset
-  "The offset of the block a read for `target-key` must START at: the block whose
-  first user_key is the largest one <= target. Binary search over the in-memory
-  index. Falls back to the first entry (offset 1, just past the format byte) when
-  the target sorts before every block."
+(defn- floor-block-idx
+  "Index position of the block a read for `target-key` must START at, or -1 when
+  the index is empty. Lower-bound semantics on equality: if several blocks share
+  the target as their first user_key (a user_key split across blocks), the FIRST
+  is returned -- entering a later one would skip that key's newest versions and
+  silently return a stale answer."
   ^long [index ^bytes target-key]
   (let [cmp (data/byte-array-comparator)
         n (count index)
-        ;; lower bound: the first block whose first user_key is >= target
         lb (loop [lo 0 hi n]
              (if (>= lo hi)
                lo
@@ -339,106 +391,89 @@
                    (recur (inc mid) hi)
                    (recur lo mid)))))]
     (cond
-      ;; A block begins exactly at the target: enter at the FIRST such block. This
-      ;; is what makes the straddle rule safe -- if a user_key's versions are split
-      ;; across blocks, several blocks share that first key, and starting at a
-      ;; later one would skip its newest versions and return a stale answer.
-      (and (< lb n) (zero? (.compare cmp (first (nth index lb)) target-key)))
-      (second (nth index lb))
-      ;; otherwise the target can only live in the preceding block (or later,
-      ;; which the forward scan handles)
-      (pos? lb) (second (nth index (dec lb)))
-      :else 1)))
+      (zero? n) -1
+      (and (< lb n) (zero? (.compare cmp (first (nth index lb)) target-key))) lb
+      (pos? lb) (dec lb)
+      :else 0)))
+
+(defn floor-block-offset
+  "Byte offset of the block a read for `target-key` must start at (see
+  `floor-block-idx`). Offset 1 -- just past the format byte -- when there is no
+  index."
+  ^long [index ^bytes target-key]
+  (let [i (floor-block-idx index target-key)]
+    (if (neg? i) 1 (second (nth index i)))))
+
+(defn floor-block-span
+  "`[start end)` for a read of `target-key`: the floor block's offset and where
+  that block ends (the next block's offset, or the end of the entries region).
+  Sizing the first channel read to the block avoids pulling in bytes the read will
+  never look at."
+  [index ^bytes target-key ^long index-start]
+  (let [i (floor-block-idx index target-key)]
+    (if (neg? i)
+      [1 index-start]
+      [(second (nth index i))
+       (if (< (inc i) (count index))
+         (second (nth index (inc i)))
+         index-start)])))
 
 (defn read-value
   "Point read: the newest version of `target-key` (a user_key) with seq <=
   `snapshot-seq`, or nil. Entries are user_key-asc / seq-desc, so the first entry
   with user_key == target and seq <= snapshot is the answer.
 
-  `footer` is the table's in-memory `{:index :index-start}`: the read seeks to the
-  floor block for `target-key` rather than scanning from the file start, and stops
-  at `:index-start` (where the entries end and the index region begins). It keeps
-  scanning past block ends until the user_key exceeds the target, so a user_key
-  whose versions straddle a block boundary is still found in full."
-  [file-path target-key snapshot-seq {:keys [index index-start]}]
-  (with-open [in-stream (io/input-stream file-path)]
-    (let [start (floor-block-offset index target-key)]
-      (skip-fully! in-stream start)
-      (loop [pos start]
-        (if (>= pos index-start)
-          nil                                          ;; end of the entries region
-          (let [entry (read-kv-pair! in-stream)]
-            (case entry
-              :eof nil
-              ;; SSTables are fsynced, so any corruption or truncation there is real.
-              (:truncated :corrupt)
-              (throw (ex-info "SSTable is corrupted"
-                              {:file (str file-path) :reason entry}))
-              (let [[ikey data] entry
-                    cmp (.compare (data/byte-array-comparator)
-                                  (:user-key ikey) target-key)
-                    next-pos (+ pos (entry-size-on-disk ikey data))]
-                (cond
-                  (neg? cmp) (recur next-pos)          ;; before the target user_key
-                  (pos? cmp) nil                       ;; past it -> not present
-                  (<= (:seq ikey) snapshot-seq) data   ;; newest visible version
-                  :else (recur next-pos))))))))))      ;; version too new; try older
+  `footer` is the table's in-memory `{:index :index-start}`: the read starts at the
+  floor block for `target-key` rather than the file start, and stops where the
+  entries end. It keeps scanning past block ends until the user_key exceeds the
+  target, so a user_key whose versions straddle a block boundary is still found in
+  full. Bytes come off the cached channel via absolute positional reads."
+  [^FileChannel ch file-path target-key snapshot-seq {:keys [index index-start]}]
+  (let [cmp (data/byte-array-comparator)
+        [start end] (floor-block-span index target-key index-start)]
+    (loop [es (entry-seq ch start index-start file-path (- end start))]
+      (when-let [[_ [ikey data]] (first es)]
+        (let [c (.compare cmp (:user-key ikey) target-key)]
+          (cond
+            (neg? c) (recur (next es))                ;; before the target user_key
+            (pos? c) nil                              ;; past it -> not present
+            (<= (:seq ikey) snapshot-seq) data        ;; newest visible version
+            :else (recur (next es))))))))             ;; too new; try an older one
 
 (defn scan-pairs
   "Range read: for each user_key in [from-key, to-key), its newest version with
   seq <= `snapshot-seq`, as [user_key data] (tombstones included; callers filter).
-  Entries are user_key-asc / seq-desc."
-  [file-path from-key to-key snapshot-seq {:keys [index index-start]}]
-  (with-open [in-stream (io/input-stream file-path)]
-    (let [start (floor-block-offset index from-key)]
-      (skip-fully! in-stream start)
-      (loop [pos start
-             pairs (transient [])
-             emitted nil]
-        (if (>= pos index-start)
-          (persistent! pairs)                          ;; end of the entries region
-          (let [entry (read-kv-pair! in-stream)]
-            (case entry
-              :eof (persistent! pairs)
-              (:truncated :corrupt)
-              (throw (ex-info "SSTable is corrupted"
-                              {:file (str file-path) :reason entry}))
-              (let [[ikey data] entry
-                    uk (:user-key ikey)
-                    next-pos (+ pos (entry-size-on-disk ikey data))]
-                (cond
-                  (data/byte-array-smaller? uk from-key) (recur next-pos pairs emitted)
-                  (data/byte-array-smaller-or-equal? to-key uk) (persistent! pairs)
-                  (and emitted (data/byte-array-equals? uk emitted))
-                  (recur next-pos pairs emitted)
-                  (> (:seq ikey) snapshot-seq) (recur next-pos pairs emitted)
-                  :else (recur next-pos (conj! pairs [uk data]) uk))))))))))
+  Entries are user_key-asc / seq-desc. Starts at the block covering `from-key`."
+  [^FileChannel ch file-path from-key to-key snapshot-seq {:keys [index index-start]}]
+  (loop [es (entry-seq ch (floor-block-offset index from-key) index-start
+                       file-path READ_CHUNK)
+         pairs (transient [])
+         emitted nil]
+    (if-let [[_ [ikey data]] (first es)]
+      (let [uk (:user-key ikey)]
+        (cond
+          (data/byte-array-smaller? uk from-key) (recur (next es) pairs emitted)
+          (data/byte-array-smaller-or-equal? to-key uk) (persistent! pairs)
+          (and emitted (data/byte-array-equals? uk emitted))
+          (recur (next es) pairs emitted)
+          (> (:seq ikey) snapshot-seq) (recur (next es) pairs emitted)
+          :else (recur (next es) (conj! pairs [uk data]) uk)))
+      (persistent! pairs))))
 
 (defn read-latest-seq
-  "The seq of the *newest* version of `target-key` (a user_key) in an SSTable, or
-  nil if the key is absent. Entries are user_key-asc / seq-desc, so the first entry
-  with user_key == target is the newest version -- its seq. Used by commit-time
-  write-write conflict detection (the blind-write lookup)."
-  [file-path target-key {:keys [index index-start]}]
-  (with-open [in-stream (io/input-stream file-path)]
-    (let [start (floor-block-offset index target-key)]
-      (skip-fully! in-stream start)
-      (loop [pos start]
-        (if (>= pos index-start)
-          nil
-          (let [entry (read-kv-pair! in-stream)]
-            (case entry
-              :eof nil
-              (:truncated :corrupt)
-              (throw (ex-info "SSTable is corrupted"
-                              {:file (str file-path) :reason entry}))
-              (let [[ikey data] entry
-                    cmp (.compare (data/byte-array-comparator)
-                                  (:user-key ikey) target-key)]
-                (cond
-                  (neg? cmp) (recur (+ pos (entry-size-on-disk ikey data)))
-                  (pos? cmp) nil          ;; past it -> not present
-                  :else (:seq ikey))))))))))  ;; first match = newest (seq-desc)
+  "The seq of the *newest* version of `target-key` in an SSTable, or nil if absent.
+  Entries are user_key-asc / seq-desc, so the first entry with user_key == target
+  is the newest. Used by commit-time write-write conflict detection."
+  [^FileChannel ch file-path target-key {:keys [index index-start]}]
+  (let [cmp (data/byte-array-comparator)
+        [start end] (floor-block-span index target-key index-start)]
+    (loop [es (entry-seq ch start index-start file-path (- end start))]
+      (when-let [[_ [ikey _]] (first es)]
+        (let [c (.compare cmp (:user-key ikey) target-key)]
+          (cond
+            (neg? c) (recur (next es))
+            (pos? c) nil
+            :else (:seq ikey)))))))
 
 ;; ---- WAL record encoding (format v2) -------------------------------------
 ;;

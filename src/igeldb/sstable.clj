@@ -6,11 +6,61 @@
             [igeldb.manifest :as manifest]
             [igeldb.store :as store])
   (:import (java.io File FileOutputStream BufferedOutputStream)
+           (java.nio.channels FileChannel)
+           (java.nio.file Paths OpenOption StandardOpenOption)
            (java.util.concurrent Semaphore)))
 
 (defn get-sstable-path
   [id dir]
   (str dir "/" id ".sst"))
+
+;; ---- cached read channels (Phase 4.5) ------------------------------------
+;;
+;; One open FileChannel per live SSTable, cached in `(:channels tree)`. Reads use
+;; absolute positional reads, which are safe for many concurrent readers on one
+;; channel, so a read no longer pays an open()/close() (~19us, and a hard
+;; throughput ceiling under concurrency).
+;;
+;; LIFECYCLE IS THE WHOLE RISK: a cached channel must never outlive its file. The
+;; only place an SSTable is deleted is `delete-inputs!`, which already holds the
+;; write lock, and channels are closed+evicted there before the files go. The
+;; store's `close!` drops the rest. No LRU bound: the live table set is already
+;; bounded by compaction.
+
+(defn- open-read-channel
+  ^FileChannel [path]
+  (FileChannel/open (Paths/get (str path) (into-array String []))
+                    (into-array OpenOption [StandardOpenOption/READ])))
+
+(defn channel-for
+  "The cached read channel for SSTable `id`, opening and caching it on first use.
+  Racing openers are harmless: the loser closes its channel and uses the winner's."
+  ^FileChannel [tree id]
+  (let [channels (:channels tree)]
+    (or (get @channels id)
+        (let [ch (open-read-channel (get-sstable-path id (:dir tree)))
+              winner (get (swap! channels
+                                 (fn [m] (if (contains? m id) m (assoc m id ch))))
+                          id)]
+          (when-not (identical? winner ch) (.close ch))
+          winner))))
+
+(defn close-channels!
+  "Close and evict the cached channels for `ids`. Called at the delete site while
+  the write lock is held, so no reader can be mid-read on those files."
+  [tree ids]
+  (let [channels (:channels tree)]
+    (doseq [id ids]
+      (when-let [^FileChannel ch (get @channels id)]
+        (swap! channels dissoc id)
+        (try (.close ch) (catch Throwable _))))))
+
+(defn close-all-channels!
+  "Close every cached channel (store shutdown). A leaked channel is an fd leak."
+  [tree]
+  (let [[old _] (reset-vals! (:channels tree) {})]
+    (doseq [[_ ^FileChannel ch] old]
+      (try (.close ch) (catch Throwable _)))))
 
 ;; Reader/writer lock built on a Semaphore (Babashka has no
 ;; ReentrantReadWriteLock). A reader takes one permit; a writer takes them all,
@@ -149,7 +199,7 @@
       (f @(:current-version tree))
       (finally (read-unlock! sem)))))
 
-(defrecord TreeStore [dir current-version rw-lock manifest]
+(defrecord TreeStore [dir current-version rw-lock manifest channels]
   store/IStoreRead
   (select
     [this k snapshot-seq]
@@ -163,7 +213,8 @@
         (loop [tables (select-order version)]
           (when-let [[id table] (first tables)]
             (if-let [v (and (blossom/hit? (:bloom-filter table) k)
-                            (io/read-value (get-sstable-path id dir) k snapshot-seq table))]
+                            (io/read-value (channel-for this id) (get-sstable-path id dir)
+                                           k snapshot-seq table))]
               v
               (recur (next tables))))))))
   (scan
@@ -188,7 +239,8 @@
                  ;; the newest version <= snapshot within its file
                  (reduce (fn [m [k d]] (assoc m k d))
                          pairs
-                         (io/scan-pairs sstable-path from-key to-key snapshot-seq table))
+                         (io/scan-pairs (channel-for this id) sstable-path
+                                        from-key to-key snapshot-seq table))
                  pairs)
                (rest tables))))))))
   (latest-seq
@@ -202,7 +254,8 @@
         (loop [tables (select-order version)]
           (when-let [[id table] (first tables)]
             (if-let [s (and (blossom/hit? (:bloom-filter table) k)
-                            (io/read-latest-seq (get-sstable-path id dir) k table))]
+                            (io/read-latest-seq (channel-for this id) (get-sstable-path id dir)
+                                                k table))]
               s
               (recur (next tables)))))))))
 
@@ -279,6 +332,8 @@
         sem (:rw-lock tree)]
     (write-lock! sem)
     (try
+      ;; close cached channels FIRST so none outlives its file
+      (close-channels! tree ids)
       (doseq [id ids]
         (let [path (get-sstable-path id dir)
               f (File. ^String path)]
@@ -323,6 +378,7 @@
     [(->TreeStore sstable-dir
                   (atom version)
                   (make-rw-lock)
-                  (manifest/open-manifest config))
+                  (manifest/open-manifest config)
+                  (atom {}))
      sstable-id
      manifest-max-seq]))

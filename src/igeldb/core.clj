@@ -6,7 +6,7 @@
             [igeldb.data :as data]
             [igeldb.flush :as f]
             [igeldb.memtable :refer [init-memtable]]
-            [igeldb.sstable :refer [restore-tree-store]]
+            [igeldb.sstable :as sstable :refer [restore-tree-store]]
             [igeldb.store :as store]
             [igeldb.tx :as tx]
             [igeldb.wal :as wal])
@@ -316,7 +316,10 @@
       (doseq [done (:worker-chans coordinator)]
         (async/alt!!
           done ([_] nil)
-          deadline ([_] (info "A background worker did not stop before the shutdown timeout")))))))
+          deadline ([_] (info "A background worker did not stop before the shutdown timeout")))))
+    ;; Workers are stopped, so nothing is mid-read: release the cached SSTable read
+    ;; channels. Leaking these would leak file descriptors.
+    (sstable/close-all-channels! (:tree kvs))))
 
 (def ^:private ^:const INIT_TIMEOUT_MS 30000)
 
