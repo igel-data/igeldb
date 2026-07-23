@@ -175,14 +175,24 @@
 ;; ---- Commit-handler (Step 4) ---------------------------------------------
 
 (defn- latest-committed-seq
-  "The latest committed seq for user_key `k`: the max of the read-path seq (the
-  applied state -- memtable/immutable/tree) and the pending seq (in-flight commits
-  confirmed under the commit lock but not yet applied). The read path alone MISSES
-  a commit during its fsync+apply window, which is exactly the lost-update gap the
-  `pending` map closes -- see `tx/pending-invariant`. 0 if `k` was never written."
+  "The latest committed seq for user_key `k`: the max of the pending seq (in-flight
+  commits confirmed under the commit lock but not yet applied) and the read-path
+  seq (the applied state -- memtable/immutable/tree). The read path alone MISSES a
+  commit during its fsync+apply window, which is the lost-update gap the `pending`
+  map closes -- see `tx/pending-invariant`. 0 if `k` was never written.
+
+  READ ORDER IS LOAD-BEARING: read `pending` FIRST, then the store. The worker moves
+  a commit from pending to the read path by applying it to the memtable and THEN
+  clearing pending (`wal/commit-batch!`). So either we read pending while it is
+  still set (caught), or it was already cleared -- which happens-after the apply, so
+  the store read below is guaranteed to see that commit. Reading the store FIRST
+  would let a commit that transitions between the two reads (store observes the OLD
+  state, then the worker applies+clears, then pending observes the CLEARED state) be
+  missed by both -> a lost update. That window is tiny, so it only surfaced under
+  load on a slower environment; this ordering makes it impossible, not merely rare."
   [kvs k]
-  (max (long (or (store/latest-seq kvs k) 0))
-       (long (or (tx/pending-seq (:registry kvs) k) 0))))
+  (let [p (long (or (tx/pending-seq (:registry kvs) k) 0))]
+    (max p (long (or (store/latest-seq kvs k) 0)))))
 
 (defn- conflict?
   "Write-write conflict (first-committer-wins): true if ANY write-set key has a
