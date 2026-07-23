@@ -1,0 +1,39 @@
+name: Jepsen
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup Java
+      uses: actions/setup-java@v5
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Install Clojure CLI
+      uses: DeLaGuardo/setup-clojure@13
+      with:
+        cli: 1.12.5.1654
+
+    - name: Cache Clojure dependencies
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.m2
+          ~/.gitlibs
+        key: ${{ runner.os }}-jepsen-${{ hashFiles('**/deps.edn') }}
+        restore-keys: |
+          ${{ runner.os }}-jepsen-
+
+    - name: Run bank and register tests
+      run: clojure -M:jepsen bank register

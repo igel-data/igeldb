@@ -18,5 +18,5 @@
            ;; all of Jepsen). Run: clojure -M:jepsen [workload...] [crash]
            :jepsen {:extra-paths ["jepsen"]
                     :extra-deps {io.github.yito88/jepsen-lite
-                                 {:git/sha "66fdff183c8e0569241279c6c984848755629bed"}}
+                                 {:git/sha "5d43f4483a314f458d620c0f8787fed44c19c891"}}
                     :main-opts ["-m" "igeldb.jepsen"]}}}
