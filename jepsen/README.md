@@ -11,9 +11,13 @@ target; each workload maps to IgelDB via an adapter + handler in
 clojure -M:jepsen               # bank + register + set + counter
 clojure -M:jepsen bank          # one workload
 clojure -M:jepsen set crash     # with the crash nemesis
+clojure -M:jepsen bank time=10  # run for 10 seconds
 ```
 
 Exits non-zero if any workload's verdict is `:valid? false`.
+
+`time=<seconds>` sets jepsen-lite's `:time-limit`. A timed run continues for
+that duration instead of ending after the workload's default operation count.
 
 | workload | checks | IgelDB feature exercised |
 |---|---|---|

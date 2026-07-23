@@ -17,6 +17,7 @@
    Run:  clojure -M:jepsen                 ; bank + register + set + counter
          clojure -M:jepsen bank            ; one workload
          clojure -M:jepsen set crash       ; with the crash nemesis
+         clojure -M:jepsen bank time=10    ; run for 10 seconds
 
    NOTE on :crash -- an :in-process 'crash' is `close!` + reopen, i.e. a CLEAN
    shutdown and recovery, not a `kill -9`. It exercises IgelDB's recovery path and
@@ -73,6 +74,8 @@
    roll back -> :fail."
   [kvs {:keys [f value]}]
   (case f
+    ;; Put the whole starting total in account 0 (the others read as 0), durably
+    :init     (igel/write! kvs (kbytes 0) (vbytes 100))
     :read     (igel/with-tx [tx kvs]
                 (into {} (map (fn [a]
                                 [a (or (->long (igel/tx-get tx (kbytes a))) 0)]))
@@ -160,31 +163,25 @@
                                         :sync-window-time 5}))
       path)))
 
-(defn- seed-bank!
-  "Put the whole starting total in account 0 (the others read as 0), durably,
-   before the run -- the bank checker verifies reads sum to :total-amount."
-  [config-path]
-  (let [kvs (igel/gen-kvs config-path)]
-    (igel/write! kvs (kbytes 0) (vbytes 100))
-    (igel/close! kvs)))
-
 ;; ---- runner ---------------------------------------------------------------
 
 (defn config
   "A jepsen-lite run config for `workload`. `opts`:
-     :nemesis  faults, e.g. [:crash]"
-  [workload {:keys [nemesis]}]
+     :nemesis     faults, e.g. [:crash]
+     :time-limit  how many seconds to run for"
+  [workload {:keys [nemesis time-limit]}]
   (let [path (fresh-config! (name workload))]
-    (when (= workload :bank) (seed-bank! path))
     (cond-> {:adapter  (map->IgelAdapter {:config-path path})
              :handler  (get handlers workload)
              :workload workload
              :name     (str "igeldb-" (name workload))
              :target   {:type :in-process}}
-      nemesis (assoc :nemesis nemesis
-                     ;; the store answers in microseconds, so a run is over fast;
-                     ;; crash often, or the fault lands after everything happened
-                     :nemesis-opts {:crashes 8 :crash-interval 1/500}))))
+      time-limit (assoc :time-limit time-limit)
+      nemesis (assoc :nemesis nemesis)
+      ;; Without a time limit the store answers so quickly that a fault can land
+      ;; after the workload; crash often enough to exercise the recovery path.
+      (and nemesis (not time-limit))
+      (assoc :nemesis-opts {:crashes 8 :crash-interval 1/500}))))
 
 (defn run-workload
   "Run one workload and return jepsen-lite's verdict map."
@@ -195,15 +192,21 @@
   (core/run (config workload opts)))
 
 (defn- parse-args
-  "Words in any order: workload names (default: all four) plus `crash`."
+  "Words in any order: workload names (default: all four), `crash`, and
+   `time=<seconds>`."
   [args]
-  (let [args     (set args)
-        chosen   (filterv (comp args name) (keys handlers))
+  (let [flags     (set (remove #(str/includes? % "=") args))
+        settings  (into {} (map #(str/split % #"=" 2))
+                        (filter #(str/includes? % "=") args))
+        chosen    (filterv (comp flags name) (keys handlers))
         workloads (if (seq chosen) chosen [:bank :register :set :counter])]
-    [workloads (cond-> {} (args "crash") (assoc :nemesis [:crash]))]))
+    [workloads (cond-> {}
+                 (flags "crash") (assoc :nemesis [:crash])
+                 (some-> (get settings "time") parse-long)
+                 (assoc :time-limit (parse-long (get settings "time"))))]))
 
 (defn -main
-  "clojure -M:jepsen [workload...] [crash]"
+  "clojure -M:jepsen [workload...] [crash] [time=<seconds>]"
   [& args]
   (let [[workloads opts] (parse-args args)
         results (doall (for [w workloads]
