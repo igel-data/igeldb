@@ -16,7 +16,8 @@
 ;;                   assigned under the commit lock, WAL record enqueued) but not
 ;;                   yet applied to the memtable by the group-commit worker. Closes
 ;;                   the gap between "commit confirmed" and "visible in the read
-;;                   path" -- see `pending-invariant` and `igeldb.core/conflict?`.
+;;                   path" -- see `pending-invariant` and
+;;                   `igeldb.commit/conflict?`.
 ;;                   Keyed by user_key, so a sorted-map keyed by the byte-array
 ;;                   comparator (byte arrays don't hash/= by value).
 ;;  - `applied`      the max seq the group-commit worker has APPLIED to the

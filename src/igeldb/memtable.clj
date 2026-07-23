@@ -79,7 +79,7 @@
     (store/latest-seq mem k))
 
   store/IStoreMutate
-  ;; The commit-handler (see `igeldb.core/commit!`) owns the write path now: it
+  ;; The commit-handler (see `igeldb.commit/commit!`) owns the write path now: it
   ;; assigns the tx seq and enqueues one WAL record to `wal-chan` under the commit
   ;; lock; the group-commit worker fsyncs and applies each record's entries to
   ;; `mem` via `write-batch!`. The Memtable therefore has no single-op mutators.

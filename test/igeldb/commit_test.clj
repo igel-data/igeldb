@@ -2,6 +2,7 @@
   (:require [clojure.java.io :as jio]
             [clojure.test :refer [deftest is testing]]
             [clj-yaml.core :as yaml]
+            [igeldb.commit :as commit]
             [igeldb.core :as igel]
             [igeldb.data :as data]
             [igeldb.io :as io]
@@ -58,20 +59,20 @@
       (igel/write! kvs (->bytes "k") (->bytes "v1"))
       (testing "a tx whose write-set key was committed after its snapshot conflicts"
         (is (= :conflict
-               (igel/commit! kvs snap
-                             [[(->bytes "k") (data/new-data (->bytes "v2"))]]))))
+               (commit/commit! kvs snap
+                               [[(->bytes "k") (data/new-data (->bytes "v2"))]]))))
       (testing "the aborted tx changed nothing"
         (is (b= (->bytes "v1") (igel/select kvs (->bytes "k")))))
       (testing "a tx at the same snapshot writing an untouched key commits"
         (is (= :committed
-               (igel/commit! kvs snap
-                             [[(->bytes "other") (data/new-data (->bytes "x"))]])))
+               (commit/commit! kvs snap
+                               [[(->bytes "other") (data/new-data (->bytes "x"))]])))
         (is (b= (->bytes "x") (igel/select kvs (->bytes "other")))))
       (testing "a tx pinned at the current seq (nothing newer) commits"
         (let [snap2 (tx/current-seq registry)]
           (is (= :committed
-                 (igel/commit! kvs snap2
-                               [[(->bytes "k") (data/new-data (->bytes "v3"))]])))
+                 (commit/commit! kvs snap2
+                                 [[(->bytes "k") (data/new-data (->bytes "v3"))]])))
           (is (b= (->bytes "v3") (igel/select kvs (->bytes "k")))))))
     (igel/close! kvs)
     (rm-rf dir)))
@@ -87,8 +88,8 @@
     (let [snap (tx/current-seq registry)]
       (igel/write! kvs (->bytes "blind") (->bytes "v1")) ;; someone else won
       (is (= :conflict
-             (igel/commit! kvs snap
-                           [[(->bytes "blind") (data/new-data (->bytes "v2"))]]))
+             (commit/commit! kvs snap
+                             [[(->bytes "blind") (data/new-data (->bytes "v2"))]]))
           "first-committer-wins covers blind writes (no read-set needed)"))
     (igel/close! kvs)
     (rm-rf dir)))
@@ -109,8 +110,8 @@
       (is (= hot-seq (store/latest-seq (:tree kvs) (->bytes "hot")))
           "hot's latest seq is discoverable from the SSTable")
       (is (= :conflict
-             (igel/commit! kvs (dec hot-seq)
-                           [[(->bytes "hot") (data/new-data (->bytes "v2"))]]))
+             (commit/commit! kvs (dec hot-seq)
+                             [[(->bytes "hot") (data/new-data (->bytes "v2"))]]))
           "a tx older than the flushed version conflicts via the tree lookup"))
     (igel/close! kvs)
     (rm-rf dir)))
@@ -193,8 +194,12 @@
   (let [dir "./test-data/commit-rmw"
         kvs (igel/gen-kvs (config-path! dir BIG))
         k (->bytes "counter")
+        ;; heavy contention on ONE key so a committing tx and the worker's
+        ;; apply+clear race constantly -- this is what surfaces both the pending
+        ;; gap and the conflict-check read-order bug (the latter was Java-11 CI only
+        ;; at a lower op count, so keep this wide).
         threads 16
-        per 40
+        per 100
         committed (atom 0)]
     (igel/write! kvs k (->bytes "0"))
     (let [->l (fn [^bytes b] (Long/parseLong (String. b)))

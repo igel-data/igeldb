@@ -3,7 +3,8 @@
             [clojure.test :refer [deftest is]]
             [clj-yaml.core :as yaml]
             [igeldb.core :as igel]
-            [igeldb.data :as data]))
+            [igeldb.data :as data]
+            [igeldb.write]))
 
 (defn- ->bytes [^String s] (.getBytes s))
 (defn- b= [a b] (data/byte-array-equals? a b))
@@ -17,7 +18,7 @@
 (defn- rm-rf [dir] (delete-recursively! (jio/file dir)))
 
 ;; `await-l0-capacity!` is private; call it through its var for these unit tests.
-(def ^:private await-l0-capacity! #'igeldb.core/await-l0-capacity!)
+(def ^:private await-l0-capacity! #'igeldb.write/await-l0-capacity!)
 
 (defn- saturated-version
   "A fake version whose L0 holds `n` (contentless) tables."
