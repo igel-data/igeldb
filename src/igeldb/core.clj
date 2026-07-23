@@ -54,7 +54,8 @@
                                            sstable-id wal-id poison ready
                                            flush-req-chan flush-wal-chan
                                            compaction-req-chan config)
-          wal-done (wal/spawn-wal-writer poison flush-req-chan flush-wal-chan config)
+          wal-done (wal/spawn-wal-writer registry poison flush-req-chan
+                                         flush-wal-chan config)
           compaction-done (compaction/spawn-compaction-worker
                            tree sstable-id compact-pointers registry poison
                            stall-monitor compaction-req-chan config)]
@@ -173,14 +174,24 @@
 
 ;; ---- Commit-handler (Step 4) ---------------------------------------------
 
+(defn- latest-committed-seq
+  "The latest committed seq for user_key `k`: the max of the read-path seq (the
+  applied state -- memtable/immutable/tree) and the pending seq (in-flight commits
+  confirmed under the commit lock but not yet applied). The read path alone MISSES
+  a commit during its fsync+apply window, which is exactly the lost-update gap the
+  `pending` map closes -- see `tx/pending-invariant`. 0 if `k` was never written."
+  [kvs k]
+  (max (long (or (store/latest-seq kvs k) 0))
+       (long (or (tx/pending-seq (:registry kvs) k) 0))))
+
 (defn- conflict?
   "Write-write conflict (first-committer-wins): true if ANY write-set key has a
   committed version newer than the tx's snapshot (its latest committed seq >
-  snapshot seq). Blind writes are included -- every key is looked up via the read
-  path (`store/latest-seq` on the KVS, bloom-filtered; 0 if never written). Runs
-  inside the commit lock."
+  snapshot seq). Blind writes are included -- every key is looked up. Runs inside
+  the commit lock, so the pending map it reads is consistent with the seq it is
+  about to assign."
   [kvs snapshot-seq entries]
-  (some (fn [[k _]] (> (or (store/latest-seq kvs k) 0) snapshot-seq)) entries))
+  (some (fn [[k _]] (> (latest-committed-seq kvs k) snapshot-seq)) entries))
 
 (defn commit!
   "The commit-handler: serialize commits under the store's commit lock, holding it
@@ -208,10 +219,17 @@
                   (if (and snapshot-seq (conflict? kvs snapshot-seq entries))
                     :conflict
                     (let [s (tx/next-seq! registry)
+                          ks (mapv first entries)
                           record (mapv (fn [[k data]] [(data/->ikey k s) data]) entries)]
+                      ;; Record the in-flight commit BEFORE enqueuing, so the worker
+                      ;; can never apply+clear it before it is recorded. On a
+                      ;; memtable switch (enqueue fails) undo it -- conditionally,
+                      ;; so a concurrent higher-seq entry for the same key survives.
+                      (tx/record-pending! registry ks s)
                       (if (async/>!! (:wal-chan @memtable) [s record comp-chan])
                         :enqueued
-                        :switched))))]
+                        (do (tx/clear-pending! registry ks s)
+                            :switched)))))]
     (case outcome
       :conflict :conflict
       :switched :switched
@@ -398,16 +416,20 @@
 (defn begin-tx
   "Start a transaction: pin the snapshot seq, register it in the active set (so the
   GC floor preserves the versions it can see), and start with an empty write-set.
-  Reading `current-seq` and registering happen under the commit lock so no commit
-  can advance the seq in between -- while the lock is held the seq is frozen, so a
-  concurrent GC-floor computation that misses the registration still sees no version
-  newer than this snapshot, keeping the floor safe."
+
+  The snapshot is pinned to `applied` -- the max seq the memtable has actually
+  applied -- NOT `current-seq`. Every seq <= `applied` is materializable by the
+  read path, so `tx-get` always sees a consistent snapshot; a seq assigned but not
+  yet applied is not externally committed (commits block until apply), so leaving
+  it out is correct, not stale. Pin + register happen under the commit lock (the
+  version pin and lock are unchanged); the floor is only made more conservative,
+  since applied snapshots are <= the old current-seq ones (see Bug-2 spec)."
   [^KVS kvs]
   (reject-if-closed! (:coordinator kvs) :begin-tx)
   (let [registry (:registry kvs)
         commit-lock (:commit-lock kvs)
         snapshot-seq (locking commit-lock
-                       (let [s (tx/current-seq registry)]
+                       (let [s (tx/current-applied registry)]
                          (tx/register-snapshot! registry s)
                          s))]
     (->Tx kvs snapshot-seq (atom (empty-write-set)) (atom false))))

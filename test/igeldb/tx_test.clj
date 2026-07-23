@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [igeldb.tx :as tx]))
 
+(defn- ->bytes [^String s] (.getBytes s))
+
 ;; ---- Step 3: active-tx tracking + min-active-snapshot-seq ------------------
 
 (deftest current-and-next-seq-test
@@ -79,3 +81,51 @@
         "all registrations were matched -- the active multiset is empty")
     (is (= 100 (tx/min-active-snapshot-seq r))
         "no lingering active tx -> floor is the current seq")))
+
+;; ---- Bug 1: the pending (in-flight commit) map ----------------------------
+
+(deftest pending-record-and-clear-test
+  (let [r (tx/create-registry)
+        a (->bytes "a")
+        b (->bytes "b")]
+    (is (nil? (tx/pending-seq r a)) "absent -> nil")
+    (tx/record-pending! r [a b] 5)
+    (is (= 5 (tx/pending-seq r a)))
+    (is (= 5 (tx/pending-seq r b)))
+    (testing "record keeps the larger seq (order-independent max)"
+      (tx/record-pending! r [a] 3)
+      (is (= 5 (tx/pending-seq r a)) "a smaller seq does not lower the entry")
+      (tx/record-pending! r [a] 9)
+      (is (= 9 (tx/pending-seq r a))))
+    (testing "clear only removes an entry still at exactly that seq"
+      (tx/clear-pending! r [a] 5)
+      (is (= 9 (tx/pending-seq r a)) "a newer in-flight seq (9) survives clear(5)")
+      (tx/clear-pending! r [a] 9)
+      (is (nil? (tx/pending-seq r a)) "clearing the current seq removes it")
+      (tx/clear-pending! r [b] 5)
+      (is (nil? (tx/pending-seq r b))))))
+
+(deftest pending-keyed-by-value-not-identity-test
+  ;; byte arrays don't hash/= by value; the pending map must still match a
+  ;; distinct byte[] with the same contents.
+  (let [r (tx/create-registry)]
+    (tx/record-pending! r [(->bytes "k")] 7)
+    (is (= 7 (tx/pending-seq r (->bytes "k")))
+        "a different byte[] with the same content resolves")))
+
+;; ---- Bug 2: the applied high-water mark -----------------------------------
+
+(deftest applied-monotonic-test
+  (let [r (tx/create-registry)]
+    (is (= 0 (tx/current-applied r)))
+    (tx/mark-applied! r 5)
+    (is (= 5 (tx/current-applied r)))
+    (testing "monotonic: a smaller seq never lowers it (out-of-order apply-marks)"
+      (tx/mark-applied! r 3)
+      (is (= 5 (tx/current-applied r)))
+      (tx/mark-applied! r 8)
+      (is (= 8 (tx/current-applied r))))
+    (testing "seed-seq! seeds both counter and applied (recovery)"
+      (tx/seed-seq! r 100)
+      (is (= 100 (tx/current-seq r)))
+      (is (= 100 (tx/current-applied r))))))

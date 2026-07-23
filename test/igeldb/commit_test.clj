@@ -181,3 +181,84 @@
       (is (= ["a1" "a2"] (mapv (comp #(String. ^bytes %) :user-key first) pairs))
           "no partial entry from the torn tx2 leaks in"))
     (rm-rf dir)))
+
+;; ---- Bug 1 + Bug 2: no lost updates under concurrent read-modify-write ----
+;;
+;; The scenario jepsen-lite's bank/counter workloads surfaced. Both fixes are
+;; needed and this exercises both: `pending` (a committing tx sees an in-flight
+;; first-committer) and applied-seq snapshots (a tx never pins a snapshot ahead of
+;; what the read path can serve, so it never computes on stale data).
+
+(deftest no-lost-updates-under-concurrent-rmw-test
+  (let [dir "./test-data/commit-rmw"
+        kvs (igel/gen-kvs (config-path! dir BIG))
+        k (->bytes "counter")
+        threads 16
+        per 40
+        committed (atom 0)]
+    (igel/write! kvs k (->bytes "0"))
+    (let [->l (fn [^bytes b] (Long/parseLong (String. b)))
+          fs (doall
+              (for [_ (range threads)]
+                (future
+                  (dotimes [_ per]
+                    (try
+                      (igel/with-tx [tx kvs]
+                        (let [cur (->l (igel/tx-get tx k))]
+                          (igel/tx-put tx k (->bytes (str (inc cur))))))
+                      (swap! committed inc)
+                      (catch clojure.lang.ExceptionInfo e
+                        ;; a conflict is the correct outcome for a racing RMW
+                        (when-not (:igeldb/conflict (ex-data e)) (throw e))))))))]
+      (doseq [f fs] @f))
+    (let [final (Long/parseLong (String. ^bytes (igel/select kvs k)))]
+      ;; every committed increment must be reflected: final == commit count. A lost
+      ;; update (a committed tx whose increment vanished) makes final < committed.
+      (is (= @committed final)
+          (str "lost updates: committed=" @committed " final=" final))
+      (is (pos? @committed) "some txs must have committed"))
+    (igel/close! kvs)
+    (rm-rf dir)))
+
+;; ---- Bug 2: the applied high-water mark --------------------------------------
+
+(deftest applied-seq-never-exceeds-current-and-catches-up-test
+  (let [dir "./test-data/commit-applied"
+        kvs (igel/gen-kvs (config-path! dir BIG))
+        registry (:registry kvs)
+        violations (atom 0)]
+    ;; hammer writes while sampling the invariant applied <= current
+    (let [stop (atom false)
+          sampler (future (while (not @stop)
+                            (when (> (tx/current-applied registry)
+                                     (tx/current-seq registry))
+                              (swap! violations inc))))]
+      (dotimes [i 500] (igel/write! kvs (->bytes (str "k" i)) (->bytes "v")))
+      (reset! stop true)
+      @sampler)
+    (is (zero? @violations) "applied-seq must never exceed current-seq")
+    (testing "once writes quiesce, applied catches up to current"
+      (is (wait-until #(= (tx/current-applied registry) (tx/current-seq registry)))
+          (str "applied=" (tx/current-applied registry)
+               " never reached current=" (tx/current-seq registry))))
+    (igel/close! kvs)
+    (rm-rf dir)))
+
+(deftest tx-snapshot-pins-to-applied-not-current-test
+  ;; A fresh tx must pin its snapshot to the applied high-water mark: it may lag
+  ;; current-seq, but tx-get must return exactly the value that snapshot can serve.
+  (let [dir "./test-data/commit-pin"
+        kvs (igel/gen-kvs (config-path! dir BIG))
+        registry (:registry kvs)]
+    (igel/write! kvs (->bytes "k") (->bytes "v0"))
+    ;; after a committed write, applied has caught up, so a tx sees v0
+    (is (wait-until #(= (tx/current-applied registry) (tx/current-seq registry))))
+    (igel/with-tx [tx kvs]
+      (is (<= (:snapshot-seq tx) (tx/current-seq registry))
+          "snapshot never exceeds current-seq")
+      (is (= (tx/current-applied registry) (:snapshot-seq tx))
+          "snapshot is pinned to the applied high-water mark")
+      (is (b= (->bytes "v0") (igel/tx-get tx (->bytes "k")))
+          "tx-get returns the value its snapshot can materialize"))
+    (igel/close! kvs)
+    (rm-rf dir)))

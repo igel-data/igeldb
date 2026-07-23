@@ -3,7 +3,8 @@
             [clojure.java.io :as java-io]
             [clojure.tools.logging :as logging]
             [igeldb.io :as io]
-            [igeldb.store :as store])
+            [igeldb.store :as store]
+            [igeldb.tx :as tx])
   (:import (java.io FileOutputStream BufferedOutputStream)))
 
 (def ^:const ^:private DEFAULT_WINDOW_TIME 200)
@@ -103,7 +104,8 @@
   memtable-apply order. Each batch element is one tx record `[seq entries
   comp-chan]`; a record's entries are never split across batches, so a tx applies
   all-or-nothing even within a multi-tx batch."
-  [^BufferedOutputStream out-stream ^FileOutputStream file-stream batch memstore size]
+  [^BufferedOutputStream out-stream ^FileOutputStream file-stream batch memstore
+   size registry]
   (try
     (.flush out-stream)
     (-> file-stream .getChannel (.force true))
@@ -120,11 +122,21 @@
   (let [entries (into [] (mapcat (fn [[_ es _]] es)) batch)]
     (store/write-batch! memstore entries)
     (swap! size + (transduce (map (fn [[ikey data]] (entry-size ikey data))) + 0 entries)))
+  ;; The writes are now PUBLISHED in the memtable (read path). Two things follow,
+  ;; both strictly after the memtable swap above:
+  ;;  - drop these commits from `pending` -- conditionally, per tx seq, so a newer
+  ;;    in-flight commit for the same key survives until its own apply.
+  ;;  - advance the applied high-water mark so `begin-tx` can pin snapshots that
+  ;;    the read path can now serve. Bumped AFTER the swap so a reader seeing the
+  ;;    new applied value definitely sees the applied data (see `tx/applied`).
+  (doseq [[seq entries _] batch]
+    (tx/clear-pending! registry (mapv (comp :user-key first) entries) seq))
+  (tx/mark-applied! registry (transduce (map first) max 0 batch))
   (doseq [[_ _ comp-chan] batch]
     (async/>!! comp-chan :done)))
 
 (defn spawn-wal-writer
-  [poison flush-req-chan flush-wal-chan config]
+  [registry poison flush-req-chan flush-wal-chan config]
   (io/make-dir (:wal-dir config))
   (let [sync-window (or (:sync-window-time config) DEFAULT_WINDOW_TIME)
         batch-limit (or (:group-commit-limit config) DEFAULT_GROUP_COMMIT_LIMIT)
@@ -170,7 +182,7 @@
                                             (if (>= (count batch) batch-limit)
                                               (do
                                                 (commit-batch! out-stream file-stream
-                                                               batch memstore size)
+                                                               batch memstore size registry)
                                                 (async/>! flush-req-chan :try-flush)
                                                 [[] (async/timeout sync-window)])
                                               [batch window-chan]))))
@@ -178,7 +190,7 @@
                                           (if (seq batch)
                                             (do
                                               (commit-batch! out-stream file-stream
-                                                             batch memstore size)
+                                                             batch memstore size registry)
                                               (async/>! flush-req-chan :try-flush)
                                               [[] (async/timeout sync-window)])
                                             [batch (async/timeout sync-window)])))]
@@ -189,7 +201,8 @@
                         ;; the memtable BEFORE the switch, then hand off to the
                         ;; flush writer.
                       (when (seq batch)
-                        (commit-batch! out-stream file-stream batch memstore size))
+                        (commit-batch! out-stream file-stream batch memstore size
+                                       registry))
                       (.close out-stream)
                       (.close file-stream)
                       (async/>! flush-req-chan :flush)

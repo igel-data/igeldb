@@ -4,6 +4,8 @@
 /data
 /test-data
 /bench-data
+/jepsen-data
+/store
 /.cpcache
 profiles.clj
 pom.xml
