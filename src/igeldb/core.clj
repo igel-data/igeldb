@@ -135,8 +135,6 @@
 
 ;; ==== Main APIs ====
 
-(def ^:private ^:const SHUTDOWN_TIMEOUT_MS 30000)
-
 (defn close!
   "Shut the store down: reject further writes, then stop the background workers.
   Explicit shutdown (rather than an `Object.finalize` hook -- GC finalization is
@@ -152,20 +150,17 @@
   `close!` is synchronous: after signaling shutdown it JOINS the background workers
   (each worker's channel closes when it exits), so once `close!` returns no flush or
   compaction thread is still reading/writing SSTable or WAL files -- a caller may
-  safely delete the data directory immediately. The join is bounded by
-  `SHUTDOWN_TIMEOUT_MS` so a wedged worker cannot hang `close!` forever."
+  safely delete the data directory immediately."
   [^KVS kvs]
   (info "KVS is shutting down...")
   (let [coordinator (:coordinator kvs)]
     (compare-and-set! (:poison coordinator) nil :closed)
     (terminate-workers coordinator)
-    ;; Join the workers. A single shared timeout bounds the total wait: once it
-    ;; fires, remaining joins fall through immediately.
-    (let [deadline (async/timeout SHUTDOWN_TIMEOUT_MS)]
-      (doseq [done (:worker-chans coordinator)]
-        (async/alt!!
-          done ([_] nil)
-          deadline ([_] (info "A background worker did not stop before the shutdown timeout")))))
+    ;; Join every worker without a deadline. Returning while even one worker is
+    ;; still alive would violate close!'s synchronization guarantee and allow a
+    ;; caller to reopen or delete the data directory while it is still in use.
+    (doseq [done (:worker-chans coordinator)]
+      (async/<!! done))
     ;; Workers are stopped, so nothing is mid-read: release the cached SSTable read
     ;; channels. Leaking these would leak file descriptors.
     (sstable/close-all-channels! (:tree kvs))))

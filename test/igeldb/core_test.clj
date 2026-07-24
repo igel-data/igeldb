@@ -1,5 +1,6 @@
 (ns igeldb.core-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.core.async :as async]
+            [clojure.test :refer [deftest is]]
             [clojure.java.io :as io]
             [clj-yaml.core :as yaml]
             [igeldb.core :as igel]
@@ -149,6 +150,38 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"store is closed"
                           (igel/scan kvs (.getBytes "a") (.getBytes "z"))))
     (delete-test-dir! (io/file data-dir) false)))
+
+(deftest close-waits-for-every-worker-test
+  ;; close! must not return while any background worker can still touch the data
+  ;; directory. In particular, there is no timeout after which it weakens that
+  ;; guarantee and lets a caller reopen the same directory.
+  (let [flush-req-chan (async/chan)
+        compaction-req-chan (async/chan)
+        first-worker (async/chan)
+        last-worker (async/chan)
+        coordinator (igel/->Coordinator flush-req-chan compaction-req-chan
+                                        (atom nil) nil nil
+                                        [first-worker last-worker])
+        kvs (igel/->KVS nil nil nil {:channels (atom {})} nil nil coordinator)
+        started (promise)
+        result (future
+                 (deliver started true)
+                 (igel/close! kvs)
+                 :closed)]
+    (try
+      @started
+      (is (= :waiting (deref result 100 :waiting))
+          "close! returned before any worker finished")
+      (async/close! first-worker)
+      (is (= :waiting (deref result 100 :waiting))
+          "close! returned while another worker was still running")
+      (async/close! last-worker)
+      (is (= :closed (deref result 1000 :waiting))
+          "close! did not return after every worker finished")
+      (finally
+        (async/close! first-worker)
+        (async/close! last-worker)
+        @result))))
 
 (deftest restore-test
   (let [data-dir "./test-data/restore-test"
