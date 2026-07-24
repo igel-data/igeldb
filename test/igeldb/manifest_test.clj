@@ -34,6 +34,12 @@
       (.seek raf offset)
       (.write raf (bit-xor b 0xff)))))
 
+(defn- write-int!
+  [path offset n]
+  (with-open [raf (RandomAccessFile. (str path) "rw")]
+    (.seek raf offset)
+    (.writeInt raf n)))
+
 (defn- edit
   "A one-table add edit with bloom filter as raw bytes (manifest form)."
   [id level head tail deleted]
@@ -48,20 +54,21 @@
   (let [dir "./test-data/manifest-replay"
         config {:sstable-dir (str dir "/sstable")}]
     (io/make-dir (:sstable-dir config))
-    (let [m (manifest/open-manifest config)]
+    (let [[m _] (manifest/open-manifest config)]
       (manifest/append-edit! m (edit 0 0 "a" "m" []))
       (manifest/append-edit! m (edit 1 0 "n" "z" []))
       ;; compaction: L1 table 2 supersedes L0 tables 0 and 1
       (manifest/append-edit! m (edit 2 1 "a" "z" [0 1]))
       (manifest/close! m))
     (testing "every committed edit is read back in order"
-      (let [edits (manifest/read-edits (manifest/manifest-path config))]
+      (let [edits (:edits (manifest/read-current-manifest config))]
         (is (= 3 (count edits)))
         (is (= 2 (-> edits (nth 2) :added first :id)))
         (is (= [0 1] (-> edits (nth 2) :deleted)))
         (is (b= (->bytes "n") (-> edits (nth 1) :added first :head-key)))))
     (testing "folding the edits reconstructs the exact per-level table set"
-      (let [edits (manifest/read-edits (manifest/manifest-path config))
+      (let [{:keys [tables edits]} (manifest/read-current-manifest config)
+            edits (into [{:added tables :deleted []}] edits)
             sstables (reduce sstable/apply-edit [[]] edits)]
         (is (= 2 (count sstables)) "levels L0 and L1")
         (is (empty? (first sstables)) "L0 empty: 0 and 1 were deleted")
@@ -70,34 +77,170 @@
 
 ;; ---- Step 1-1: corruption classes ----------------------------------------
 
+(deftest manifest-header-validation-test
+  (testing "unsupported versions are rejected explicitly"
+    (let [dir "./test-data/manifest-version"
+          config {:sstable-dir (str dir "/sstable")}]
+      (io/make-dir (:sstable-dir config))
+      (let [[m _] (manifest/open-manifest config)]
+        (manifest/close! m))
+      ;; magic occupies bytes 0..7; the format version is the following int.
+      (write-int! (manifest/current-manifest-path config) 8 99)
+      (let [error (try
+                    (manifest/read-current-manifest config)
+                    nil
+                    (catch clojure.lang.ExceptionInfo e e))]
+        (is (:igeldb/unsupported-manifest-version (ex-data error)))
+        (is (= 99 (:version (ex-data error)))))
+      (rm-rf dir)))
+  (testing "bad magic and an incomplete mandatory snapshot are corruption"
+    (doseq [[suffix corrupt!]
+            [["magic" #(flip-byte! % 0)]
+             ["snapshot" #(truncate-file! % 30)]]]
+      (let [dir (str "./test-data/manifest-" suffix)
+            config {:sstable-dir (str dir "/sstable")}]
+        (io/make-dir (:sstable-dir config))
+        (let [[m _] (manifest/open-manifest config)]
+          (manifest/close! m))
+        (corrupt! (manifest/current-manifest-path config))
+        (let [error (try
+                      (manifest/read-current-manifest config)
+                      nil
+                      (catch clojure.lang.ExceptionInfo e e))]
+          (is (:igeldb/manifest-corrupt (ex-data error))))
+        (rm-rf dir))))
+  (testing "the old unversioned manifest is rejected instead of guessed"
+    (let [dir "./test-data/manifest-legacy"
+          config {:sstable-dir (str dir "/sstable")}]
+      (io/make-dir (:sstable-dir config))
+      (spit (str (:sstable-dir config) "/MANIFEST") "legacy")
+      (let [error (try
+                    (manifest/open-manifest config)
+                    nil
+                    (catch clojure.lang.ExceptionInfo e e))]
+        (is (:igeldb/unsupported-manifest-version (ex-data error)))
+        (is (zero? (:version (ex-data error)))))
+      (rm-rf dir))))
+
 (deftest manifest-truncation-tolerated-test
   (let [dir "./test-data/manifest-trunc"
-        config {:sstable-dir (str dir "/sstable")}
-        path (manifest/manifest-path config)]
+        config {:sstable-dir (str dir "/sstable")}]
     (io/make-dir (:sstable-dir config))
-    (let [m (manifest/open-manifest config)]
+    (let [[m _] (manifest/open-manifest config)]
       (manifest/append-edit! m (edit 0 0 "a" "z" []))
       (manifest/append-edit! m (edit 1 0 "a" "z" []))
       (manifest/close! m))
-    ;; cut a few bytes off the last edit -> its tail is incomplete
-    (truncate-file! path (- (.length (jio/file path)) 3))
-    (is (= 1 (count (manifest/read-edits path)))
-        "a partial tail edit is tolerated; the earlier edit survives")
+    (let [path (manifest/current-manifest-path config)]
+      ;; cut a few bytes off the last edit -> its tail is incomplete
+      (truncate-file! path (- (.length (jio/file path)) 3))
+      (is (= 1 (count (:edits (manifest/read-current-manifest config))))
+          "a partial tail edit is tolerated; the earlier edit survives")
+      ;; Reopening truncates the torn frame before appending. A later valid edit
+      ;; must therefore remain reachable on the next replay.
+      (let [[m recovery] (manifest/open-manifest config)]
+        (is (= 1 (count (:edits recovery))))
+        (manifest/append-edit! m (edit 2 0 "a" "z" []))
+        (manifest/close! m))
+      (is (= [0 2] (mapv #(-> % :added first :id)
+                         (:edits (manifest/read-current-manifest config))))
+          "a valid edit appended after recovery is reachable"))
     (rm-rf dir)))
 
 (deftest manifest-midfile-corruption-raises-test
   (let [dir "./test-data/manifest-corrupt"
-        config {:sstable-dir (str dir "/sstable")}
-        path (manifest/manifest-path config)]
+        config {:sstable-dir (str dir "/sstable")}]
     (io/make-dir (:sstable-dir config))
-    (let [m (manifest/open-manifest config)]
+    (let [[m _] (manifest/open-manifest config)]
       (manifest/append-edit! m (edit 0 0 "a" "z" []))
       (manifest/append-edit! m (edit 1 0 "a" "z" []))
       (manifest/close! m))
-    ;; flip a byte inside the first edit's data -> its CRC no longer matches
-    (flip-byte! path 12)
-    (is (thrown? clojure.lang.ExceptionInfo (manifest/read-edits path))
-        "mid-file corruption must raise, not silently truncate")
+    (let [path (manifest/current-manifest-path config)]
+      ;; Header = 24 bytes and the empty snapshot frame = 41 bytes. Offset 80 is
+      ;; inside the first edit payload, so its CRC no longer matches.
+      (flip-byte! path 80)
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (manifest/read-current-manifest config))
+          "mid-file corruption must raise, not silently truncate"))
+    (rm-rf dir)))
+
+(defn- rotation-config
+  [dir]
+  {:sstable-dir (str dir "/sstable")
+   :manifest-rotation-bytes Long/MAX_VALUE
+   :manifest-rotation-edits 1})
+
+(deftest manifest-rotation-preserves-snapshot-and-high-water-marks-test
+  (let [dir "./test-data/manifest-rotation"
+        config (rotation-config dir)
+        committed (assoc (edit 7 1 "a" "z" []) :max-seq 42)]
+    (io/make-dir (:sstable-dir config))
+    (let [[m _] (manifest/open-manifest config)
+          old-path (manifest/current-manifest-path config)]
+      (manifest/append-edit! m committed)
+      (is (true? (manifest/maybe-rotate! m (:added committed))))
+      (is (not= old-path (manifest/current-manifest-path config)))
+      (manifest/close! m))
+    (let [{:keys [generation tables edits next-table-id max-seq]}
+          (manifest/read-current-manifest config)
+          manifest-files (filter #(re-matches #"MANIFEST-\d{20}" (.getName %))
+                                 (.listFiles (jio/file (:sstable-dir config))))]
+      (is (= 2 generation))
+      (is (= [7] (mapv :id tables)))
+      (is (empty? edits))
+      (is (= 8 next-table-id))
+      (is (= 42 max-seq))
+      (is (= 1 (count manifest-files)) "obsolete generations are removed"))
+    (rm-rf dir)))
+
+(deftest manifest-rotation-before-current-switch-is-recoverable-test
+  (let [dir "./test-data/manifest-rotation-before-current"
+        config (rotation-config dir)
+        committed (assoc (edit 3 0 "a" "z" []) :max-seq 11)]
+    (io/make-dir (:sstable-dir config))
+    (let [[m _] (manifest/open-manifest config)
+          old-path (manifest/current-manifest-path config)]
+      (manifest/append-edit! m committed)
+      (binding [manifest/*rotation-step-hook*
+                #(when (= :new-manifest-fsynced %)
+                   (throw (ex-info "simulated crash" {})))]
+        (is (false? (manifest/maybe-rotate! m (:added committed)))))
+      (is (= old-path (manifest/current-manifest-path config))
+          "CURRENT still names the old, complete generation")
+      (manifest/close! m))
+    (let [{:keys [tables edits next-table-id max-seq]}
+          (manifest/read-current-manifest config)]
+      (is (empty? tables))
+      (is (= [3] (mapv #(-> % :added first :id) edits)))
+      (is (= 4 next-table-id))
+      (is (= 11 max-seq)))
+    (rm-rf dir)))
+
+(deftest manifest-rotation-after-current-switch-is-fatal-but-recoverable-test
+  (let [dir "./test-data/manifest-rotation-after-current"
+        config (rotation-config dir)
+        committed (assoc (edit 5 0 "a" "z" []) :max-seq 17)]
+    (io/make-dir (:sstable-dir config))
+    (let [[m _] (manifest/open-manifest config)
+          old-path (manifest/current-manifest-path config)]
+      (manifest/append-edit! m committed)
+      (let [error
+            (binding [manifest/*rotation-step-hook*
+                      #(when (= :current-replaced %)
+                         (throw (ex-info "simulated crash" {})))]
+              (try
+                (manifest/maybe-rotate! m (:added committed))
+                nil
+                (catch clojure.lang.ExceptionInfo e e)))]
+        (is (:igeldb/manifest-rotation-fatal (ex-data error))))
+      (is (not= old-path (manifest/current-manifest-path config))
+          "CURRENT already names the new snapshot")
+      (manifest/close! m))
+    (let [{:keys [tables edits next-table-id max-seq]}
+          (manifest/read-current-manifest config)]
+      (is (= [5] (mapv :id tables)))
+      (is (empty? edits))
+      (is (= 6 next-table-id))
+      (is (= 17 max-seq)))
     (rm-rf dir)))
 
 ;; ---- integration helpers -------------------------------------------------

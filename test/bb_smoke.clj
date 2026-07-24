@@ -35,7 +35,9 @@
                 :wal-dir (str data-dir "/wal")
                 ;; small memtable so a few hundred writes flush + compact
                 :memtable-size 256
-                :sync-window-time 10}
+                :sync-window-time 10
+                ;; Exercise snapshot rotation on the Babashka durable path.
+                :manifest-rotation-edits 4}
         path (str data-dir "/config.yaml")]
     (spit path (yaml/generate-string config))
     path))

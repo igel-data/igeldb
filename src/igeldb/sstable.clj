@@ -296,6 +296,24 @@
             (mapv #(update % :bloom-filter blossom/deserialize-filter bloom-config)
                   added))))
 
+(defn- version->manifest-tables
+  "Flatten an in-memory version into snapshot table entries with serialized
+  Bloom filters. Sparse indexes are derived from SSTable footers and are not
+  manifest data."
+  [version]
+  (into []
+        (mapcat (fn [[level tables]]
+                  (map (fn [[id info]]
+                         {:id id
+                          :level level
+                          :size (:size info)
+                          :head-key (:head-key info)
+                          :tail-key (:tail-key info)
+                          :bloom-filter (blossom/serialize-filter
+                                         (:bloom-filter info))})
+                       tables)))
+        (map-indexed vector version)))
+
 (defn commit-edit!
   "The single durable commit path for flush and compaction. Serialized across
   callers by the manifest lock: append+fsync the edit to the manifest (the commit
@@ -313,7 +331,8 @@
         commit-lock (:lock manifest)]
     (locking commit-lock
       (manifest/append-edit! manifest (serialize-edit-blooms edit))
-      (swap! (:current-version tree) apply-edit edit))))
+      (let [version (swap! (:current-version tree) apply-edit edit)]
+        (manifest/maybe-rotate! manifest (version->manifest-tables version))))))
 
 ;; ---- Deferred-safe physical deletion (Step 5) ----------------------------
 
@@ -356,7 +375,11 @@
   shutdown; see `igeldb.core/gen-kvs`)."
   [{:keys [sstable-dir] :as config}]
   (io/make-dir sstable-dir)
-  (let [raw-edits (manifest/read-edits (manifest/manifest-path config))
+  (let [[manifest recovery] (manifest/open-manifest config)
+        raw-edits (into [{:added (:tables recovery)
+                          :deleted []
+                          :max-seq (:max-seq recovery)}]
+                        (:edits recovery))
         edits (map #(deserialize-edit-blooms % (:bloom-filter config)) raw-edits)
         ;; Load each LIVE table's footer (sparse index) after folding the edits --
         ;; a table added by one edit and deleted by a later one has no file left,
@@ -369,16 +392,14 @@
                                             (get-sstable-path id sstable-dir)))])
                               level))
                       (reduce apply-edit [[]] edits))
-        max-id (reduce (fn [m e] (reduce (fn [m a] (max m (:id a))) m (:added e)))
-                       -1 raw-edits)
-        manifest-max-seq (reduce (fn [m e] (max m (or (:max-seq e) 0))) 0 raw-edits)
-        sstable-id (inc max-id)]
+        manifest-max-seq (:max-seq recovery)
+        sstable-id (:next-table-id recovery)]
     (logging/info "Restored table set from manifest; next SSTable id" sstable-id
                   "manifest max-seq" manifest-max-seq)
     [(->TreeStore sstable-dir
                   (atom version)
                   (make-rw-lock)
-                  (manifest/open-manifest config)
+                  manifest
                   (atom {}))
      sstable-id
      manifest-max-seq]))

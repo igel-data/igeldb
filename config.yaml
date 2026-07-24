@@ -30,6 +30,10 @@
   # Defaults to memtable-size.
   # sstable-target-size: 16777216,
 
+  # Rotate the manifest to a full snapshot after either threshold is reached.
+  # manifest-rotation-bytes: 16777216,
+  # manifest-rotation-edits: 10000,
+
   # Bloom filter config
   bloom-filter:
   {

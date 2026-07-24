@@ -32,6 +32,8 @@
     (is (number? (:l0-compaction-trigger loaded)))
     (is (number? (:l0-stall-threshold loaded)))
     (is (number? (:level-size-multiplier loaded)))
+    (is (number? (:manifest-rotation-bytes loaded)))
+    (is (number? (:manifest-rotation-edits loaded)))
     ;; derived from memtable-size (* l0-compaction-trigger for l1 base)
     (is (= (:memtable-size loaded) (:sstable-target-size loaded)))
     (is (= (* (:memtable-size loaded) (:l0-compaction-trigger loaded))

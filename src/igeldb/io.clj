@@ -47,14 +47,18 @@
     (.get buf ^bytes uk)
     (data/->ikey uk s)))
 
-(defn- calc-crc32 [data]
+(defn crc32
+  "Return the unsigned CRC32 value for `data`.
+
+  File formats choose how many bytes encode the value: regular framed segments
+  store it as a long, while the manifest's fixed header stores it as an int."
+  [data]
   (let [crc32 (CRC32.)]
     (.update crc32 data)
     (.getValue crc32)))
 
 (defn- valid-data? [data crc]
-  (let [crc32 (doto (CRC32.) (.update data))]
-    (= (.getValue crc32) crc)))
+  (= (crc32 data) crc))
 
 (defn make-dir
   [dir]
@@ -75,17 +79,18 @@
 ; Data format in an SSTable
 ; | Key0 | Value0 | Key1 | Value1 | ...
 ; - Each key or value's data format
-; | Length (8 bytes) | Data (Length bytes) | CRC (4 byters) |
+; | Length (8 bytes) | Data (Length bytes) | CRC (8 bytes) |
 
 (def ^:private ^:const LEN_SIZE Long/BYTES)
 (def ^:private ^:const CRC_SIZE Long/BYTES)
+(def ^:const FRAME_OVERHEAD (+ LEN_SIZE CRC_SIZE))
 
 (defn write-bytes!
   [^BufferedOutputStream out-stream ^bytes b]
   (doto out-stream
     (.write (serialize-long (count b)))
     (.write b)
-    (.write (serialize-long (calc-crc32 b)))))
+    (.write (serialize-long (crc32 b)))))
 
 (defn write-tombstone!
   [^BufferedOutputStream out-stream]

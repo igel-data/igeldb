@@ -107,6 +107,12 @@ Configuration is a YAML file (see `gen-kvs`). Key parameters:
 | `l0-compaction-trigger` | L0 table count that triggers L0→L1 compaction |
 | `l0-stall-threshold` | L0 table count at which writers stall (back-pressure safety valve) |
 | `level-size-multiplier` | Per-level size growth factor |
+| `manifest-rotation-bytes` | Manifest edit bytes between full snapshot rotations |
+| `manifest-rotation-edits` | Manifest edit count between full snapshot rotations |
+
+Manifest format v1 uses `CURRENT` to select a generational
+`MANIFEST-<generation>` file. Earlier unversioned `MANIFEST` files are rejected;
+they are not upgraded automatically.
 
 An open IgelDB instance exclusively owns both configured storage directories.
 Opening another instance that shares either directory fails until the first

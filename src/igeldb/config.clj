@@ -14,6 +14,8 @@
 (def ^:private ^:const DEFAULT_L0_COMPACTION_TRIGGER 4)
 (def ^:private ^:const DEFAULT_L0_STALL_THRESHOLD 16)
 (def ^:private ^:const DEFAULT_LEVEL_SIZE_MULTIPLIER 10)
+(def ^:private ^:const DEFAULT_MANIFEST_ROTATION_BYTES (* 16 1024 1024))
+(def ^:private ^:const DEFAULT_MANIFEST_ROTATION_EDITS 10000)
 
 (defn- read-config
   [config-path]
@@ -32,7 +34,9 @@
                  :sstable-block-size DEFAULT_SSTABLE_BLOCK_SIZE
                  :l0-compaction-trigger DEFAULT_L0_COMPACTION_TRIGGER
                  :l0-stall-threshold DEFAULT_L0_STALL_THRESHOLD
-                 :level-size-multiplier DEFAULT_LEVEL_SIZE_MULTIPLIER}
+                 :level-size-multiplier DEFAULT_LEVEL_SIZE_MULTIPLIER
+                 :manifest-rotation-bytes DEFAULT_MANIFEST_ROTATION_BYTES
+                 :manifest-rotation-edits DEFAULT_MANIFEST_ROTATION_EDITS}
         merged (merge default config)
         ;; Derived defaults: computed from the *merged* values so a user's
         ;; `memtable-size` / `l0-compaction-trigger` overrides flow through,
@@ -49,7 +53,8 @@
     (doseq [k [:memtable-size :sync-window-time :group-commit-limit
                :l0-compaction-trigger :l0-stall-threshold
                :level-size-multiplier :l1-base-size :sstable-target-size
-               :sstable-block-size]]
+               :sstable-block-size :manifest-rotation-bytes
+               :manifest-rotation-edits]]
       (when-not (pos? (k result))
         (throw (ex-info (str "`" (name k) "` should be positive in the config")
                         result))))
