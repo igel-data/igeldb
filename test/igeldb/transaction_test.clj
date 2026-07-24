@@ -69,6 +69,35 @@
       (is (= before (tx/current-seq (:registry kvs)))
           "a read-only tx assigns no seq (no WAL record, free commit)"))))
 
+;; ---- finished transaction handles ----------------------------------------
+
+(defn- tx-closed-ex
+  [f]
+  (try
+    (f)
+    nil
+    (catch clojure.lang.ExceptionInfo e
+      (when (:igeldb/tx-closed (ex-data e)) e))))
+
+(deftest tx-operations-reject-finished-handles-test
+  (with-store [kvs "./test-data/tx-finished"]
+    (doseq [[end-name finish!] [[:commit igel/commit-tx]
+                                [:rollback igel/rollback-tx]]]
+      (let [tx (igel/begin-tx kvs)
+            k (->bytes (name end-name))
+            v (->bytes "v")]
+        (finish! tx)
+        (doseq [[op-name op] [[:tx-get #(igel/tx-get tx k)]
+                              [:tx-put #(igel/tx-put tx k v)]
+                              [:tx-delete #(igel/tx-delete tx k)]
+                              [:commit-tx #(igel/commit-tx tx)]
+                              [:rollback-tx #(igel/rollback-tx tx)]]]
+          (testing (str (name op-name) " after " (name end-name))
+            (let [ex (tx-closed-ex op)]
+              (is (some? ex))
+              (is (= op-name (:op (ex-data ex))))
+              (is (false? (:retriable (ex-data ex)))))))))))
+
 ;; ---- atomicity + one-seq-per-tx ------------------------------------------
 
 (deftest multi-key-tx-is-atomic-and-shares-one-seq-test
@@ -151,6 +180,21 @@
                   :conflicted))]
       (is (= :done ret))
       (is (s= "3" (igel/select kvs (->bytes "k")))))))
+
+(deftest with-tx-preserves-commit-conflict-test
+  (with-store [kvs "./test-data/with-tx-conflict"]
+    (igel/write! kvs (->bytes "k") (->bytes "0"))
+    (let [ex (try
+               (igel/with-tx [tx kvs]
+                 (igel/tx-get tx (->bytes "k"))
+                 (igel/write! kvs (->bytes "k") (->bytes "1"))
+                 (igel/tx-put tx (->bytes "k") (->bytes "2")))
+               nil
+               (catch clojure.lang.ExceptionInfo e e))]
+      (is (:igeldb/conflict (ex-data ex))
+          "with-tx propagates the original conflict")
+      (is (not (:igeldb/tx-closed (ex-data ex)))
+          "cleanup does not replace the conflict with a finished-tx error"))))
 
 ;; ---- the snapshot leaves the active set on end ----------------------------
 

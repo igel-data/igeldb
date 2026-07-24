@@ -261,35 +261,48 @@
     (->Tx kvs snapshot-seq (atom (empty-write-set)) (atom false))))
 
 (defn- finish!
-  "Deregister the tx's snapshot exactly once (idempotent via CAS), so an explicit
-  commit/rollback plus `with-tx`'s finally never double-decrement the active set."
+  "Mark the tx finished and deregister its snapshot exactly once."
   [^Tx tx]
   (when (compare-and-set! (:finished? tx) false true)
     (tx/deregister-snapshot! (:registry (:kvs tx)) (:snapshot-seq tx))))
 
+(defn- reject-if-finished!
+  [^Tx tx op]
+  (when @(:finished? tx)
+    (throw (ex-info (str (name op) " rejected: the transaction is finished")
+                    {:igeldb/tx-closed true
+                     :op op
+                     :retriable false}))))
+
 (defn tx-get
   "Read `k` inside the tx: the tx's own buffered write wins (read-your-writes),
   otherwise the store at the tx's snapshot seq. Returns the value bytes, or nil for
-  an absent key or the tx's own tombstone."
+  an absent key or the tx's own tombstone. Rejects a finished transaction."
   [^Tx tx ^bytes k]
-  (let [ws @(:write-set tx)]
-    (if (contains? ws k)
-      (let [d (get ws k)] (when (data/is-valid? d) (:value d)))
-      (store/select (:kvs tx) k (:snapshot-seq tx)))))
+  (locking tx
+    (reject-if-finished! tx :tx-get)
+    (let [ws @(:write-set tx)]
+      (if (contains? ws k)
+        (let [d (get ws k)] (when (data/is-valid? d) (:value d)))
+        (store/select (:kvs tx) k (:snapshot-seq tx))))))
 
 (defn tx-put
   "Buffer a write of `k`=`v` into the tx's write-set (folding an earlier write of
-  the same key). Not durable until `commit-tx`."
+  the same key). Not durable until `commit-tx`. Rejects a finished transaction."
   [^Tx tx ^bytes k ^bytes v]
-  (swap! (:write-set tx) assoc k (data/new-data v))
-  nil)
+  (locking tx
+    (reject-if-finished! tx :tx-put)
+    (swap! (:write-set tx) assoc k (data/new-data v))
+    nil))
 
 (defn tx-delete
   "Buffer a delete of `k` into the tx's write-set (a tombstone). Not durable until
-  `commit-tx`."
+  `commit-tx`. Rejects a finished transaction."
   [^Tx tx ^bytes k]
-  (swap! (:write-set tx) assoc k (data/deleted-data))
-  nil)
+  (locking tx
+    (reject-if-finished! tx :tx-delete)
+    (swap! (:write-set tx) assoc k (data/deleted-data))
+    nil))
 
 (defn commit-tx
   "Commit the transaction. An empty write-set (a read-only tx) is a no-op. Otherwise
@@ -297,29 +310,33 @@
   (write-write conflict detection, first-committer-wins). Returns `:committed`; on a
   conflict throws an ex-info tagged `:igeldb/conflict` (retriable) that the caller
   may catch to retry -- the tx is rolled back (deregistered) either way. The snapshot
-  is always deregistered exactly once."
+  is always deregistered exactly once. Rejects a finished transaction."
   [^Tx tx]
-  (let [{:keys [kvs snapshot-seq write-set]} tx
-        ws @write-set]
-    (try
-      (if (empty? ws)
-        :committed
-        (let [result (write-path/run-mutation!
-                      (:coordinator kvs) (:tree kvs) (:config kvs) :commit-tx
-                      #(commit/tx-commit-attempt! kvs snapshot-seq (vec ws)))]
-          (if (= result :conflict)
-            (throw (ex-info "Transaction conflict; the write-set was committed by another tx"
-                            {:igeldb/conflict true :retriable true}))
-            :committed)))
-      (finally (finish! tx)))))
+  (locking tx
+    (reject-if-finished! tx :commit-tx)
+    (let [{:keys [kvs snapshot-seq write-set]} tx
+          ws @write-set]
+      (try
+        (if (empty? ws)
+          :committed
+          (let [result (write-path/run-mutation!
+                        (:coordinator kvs) (:tree kvs) (:config kvs) :commit-tx
+                        #(commit/tx-commit-attempt! kvs snapshot-seq (vec ws)))]
+            (if (= result :conflict)
+              (throw (ex-info "Transaction conflict; the write-set was committed by another tx"
+                              {:igeldb/conflict true :retriable true}))
+              :committed)))
+        (finally (finish! tx))))))
 
 (defn rollback-tx
   "Abort the transaction: discard the buffered write-set and deregister the snapshot.
-  Idempotent with `commit-tx` (the snapshot is deregistered exactly once)."
+  Rejects a finished transaction."
   [^Tx tx]
-  (reset! (:write-set tx) (empty-write-set))
-  (finish! tx)
-  nil)
+  (locking tx
+    (reject-if-finished! tx :rollback-tx)
+    (reset! (:write-set tx) (empty-write-set))
+    (finish! tx)
+    nil))
 
 (defmacro with-tx
   "Run `body` in a transaction bound to `tx-sym`: begin, evaluate the body, then
@@ -333,5 +350,8 @@
          (commit-tx ~tx-sym)
          result#)
        (catch Throwable e#
-         (rollback-tx ~tx-sym)
+         ;; A failed commit finishes the tx in its `finally`; do not replace its
+         ;; conflict/IO exception with a secondary "transaction is finished".
+         (when-not @(:finished? ~tx-sym)
+           (rollback-tx ~tx-sym))
          (throw e#)))))
