@@ -108,6 +108,10 @@ Configuration is a YAML file (see `gen-kvs`). Key parameters:
 | `l0-stall-threshold` | L0 table count at which writers stall (back-pressure safety valve) |
 | `level-size-multiplier` | Per-level size growth factor |
 
+An open IgelDB instance exclusively owns both configured storage directories.
+Opening another instance that shares either directory fails until the first
+instance's synchronous `close!` returns.
+
 ## License
 
 Copyright © 2023 Yuji Ito

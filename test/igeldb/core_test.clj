@@ -1,6 +1,6 @@
 (ns igeldb.core-test
   (:require [clojure.core.async :as async]
-            [clojure.test :refer [deftest is]]
+            [clojure.test :refer [deftest is testing]]
             [clojure.java.io :as io]
             [clj-yaml.core :as yaml]
             [igeldb.core :as igel]
@@ -162,7 +162,7 @@
         coordinator (igel/->Coordinator flush-req-chan compaction-req-chan
                                         (atom nil) nil nil
                                         [first-worker last-worker])
-        kvs (igel/->KVS nil nil nil {:channels (atom {})} nil nil coordinator)
+        kvs (igel/->KVS nil nil nil {:channels (atom {})} nil nil coordinator [])
         started (promise)
         result (future
                  (deliver started true)
@@ -182,6 +182,55 @@
         (async/close! first-worker)
         (async/close! last-worker)
         @result))))
+
+(deftest directories-have-exclusive-ownership-test
+  (let [data-dir "./test-data/directory-lock-test"
+        config (make-test-config data-dir)
+        config-path (setup-test! data-dir config)
+        kvs (igel/gen-kvs config-path)]
+    (try
+      (let [ex (try
+                 (igel/gen-kvs config-path)
+                 nil
+                 (catch clojure.lang.ExceptionInfo e e))]
+        (is (:igeldb/directory-locked (ex-data ex)))
+        (is (false? (:retriable (ex-data ex)))))
+      (finally (igel/close! kvs)))
+    (testing "closing releases ownership for a later instance"
+      (let [reopened (igel/gen-kvs config-path)]
+        (igel/close! reopened)))
+    (delete-test-dir! (io/file data-dir) false)))
+
+(deftest sharing-either-storage-directory-is-rejected-test
+  (let [data-dir "./test-data/shared-directory-lock-test"
+        first-config (make-test-config (str data-dir "/first"))
+        first-path (setup-test! data-dir first-config)
+        write-config! (fn [name config]
+                        (let [path (str data-dir "/" name ".yaml")]
+                          (with-open [writer (io/writer path)]
+                            (.write writer (yaml/generate-string config)))
+                          path))
+        shared-sstable-path
+        (write-config! "shared-sstable"
+                       (assoc (make-test-config (str data-dir "/second"))
+                              :sstable-dir (:sstable-dir first-config)))
+        shared-wal-path
+        (write-config! "shared-wal"
+                       (assoc (make-test-config (str data-dir "/third"))
+                              :wal-dir (:wal-dir first-config)))
+        kvs (igel/gen-kvs first-path)]
+    (try
+      (doseq [[label path] [["SSTable" shared-sstable-path]
+                            ["WAL" shared-wal-path]]]
+        (testing (str label " directory cannot be shared")
+          (let [ex (try
+                     (igel/gen-kvs path)
+                     nil
+                     (catch clojure.lang.ExceptionInfo e e))]
+            (is (:igeldb/directory-locked (ex-data ex))))))
+      (finally
+        (igel/close! kvs)
+        (delete-test-dir! (io/file data-dir) false)))))
 
 (deftest restore-test
   (let [data-dir "./test-data/restore-test"

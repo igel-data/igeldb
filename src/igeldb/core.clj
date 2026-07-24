@@ -6,6 +6,7 @@
             [igeldb.config :as config]
             [igeldb.data :as data]
             [igeldb.flush :as f]
+            [igeldb.lock :as db-lock]
             [igeldb.memtable :refer [init-memtable]]
             [igeldb.scan :as scan-impl]
             [igeldb.sstable :as sstable :refer [restore-tree-store]]
@@ -80,7 +81,7 @@
     (throw (ex-info (str (name op) " rejected: the store is closed") {}))))
 
 (defrecord KVS [config memtable immutable-memtable tree registry commit-lock
-                coordinator]
+                coordinator directory-locks]
   store/IStoreRead
   (select
     [_ k snapshot-seq]
@@ -161,41 +162,64 @@
     ;; caller to reopen or delete the data directory while it is still in use.
     (doseq [done (:worker-chans coordinator)]
       (async/<!! done))
-    ;; Workers are stopped, so nothing is mid-read: release the cached SSTable read
-    ;; channels. Leaking these would leak file descriptors.
-    (sstable/close-all-channels! (:tree kvs))))
+    (try
+      ;; Workers are stopped, so nothing is mid-read: release the cached SSTable
+      ;; read channels. Leaking these would leak file descriptors.
+      (sstable/close-all-channels! (:tree kvs))
+      (finally
+        ;; Release ownership last. Once this happens, another IgelDB instance may
+        ;; open these directories.
+        (db-lock/release-all! (:directory-locks kvs))))))
 
 (def ^:private ^:const INIT_TIMEOUT_MS 30000)
 
 (defn gen-kvs
+  "Open an IgelDB store from `config-path`.
+
+  The configured SSTable and WAL directories are held with exclusive filesystem
+  locks until `close!` returns. If either directory is already owned by another
+  IgelDB instance or process, throws an ex-info tagged
+  `:igeldb/directory-locked`."
   [config-path]
   (let [config (config/load-config config-path)
-        [tree sstable-id manifest-max-seq] (restore-tree-store config)
-        ;; global commit-order / MVCC state (shared across memtable generations):
-        ;; the seq counter + the active-tx snapshot set. init-memtable seeds the
-        ;; counter from the replayed WAL's max seq; then fold in the manifest's
-        ;; max-seq so next-seq = max(manifest max-seq, WAL max-seq) + 1. The manifest
-        ;; part is essential: a clean shutdown right after a flush leaves an empty
-        ;; WAL, so the newest seq can live only in SSTables.
-        registry (tx/create-registry)
-        [wal-id memtable-val] (init-memtable (async/chan) registry config)
-        _ (tx/seed-seq! registry (max manifest-max-seq (tx/current-seq registry)))
-        memtable (atom memtable-val)
-        ;; Holds the memtable currently being flushed (nil when no flush is in
-        ;; progress). Reads consult it between the mutable memtable and the
-        ;; version, closing the flush-visibility gap (see KVS/select).
-        immutable-memtable (atom nil)
-        ;; serializes the commit-handler's {conflict-check -> seq assign ->
-        ;; enqueue} critical section (see `commit/commit!`)
-        commit-lock (Object.)
-        coordinator (spawn-bg-workers memtable immutable-memtable tree registry
-                                      (atom sstable-id) (atom wal-id) config)]
-    ;; Block until the initial flush has established the first WAL generation
-    ;; (and, on restart, committed the replayed WAL to an SSTable).
-    (when-not (true? (deref (:ready coordinator) INIT_TIMEOUT_MS :timeout))
-      (throw (ex-info "Initializing KVS failed" {} @(:poison coordinator))))
-    (->KVS config memtable immutable-memtable tree registry commit-lock
-           coordinator)))
+        directory-locks (db-lock/acquire-all!
+                         [(:sstable-dir config) (:wal-dir config)])]
+    (try
+      (let [[tree sstable-id manifest-max-seq] (restore-tree-store config)
+            ;; global commit-order / MVCC state (shared across memtable generations):
+            ;; the seq counter + the active-tx snapshot set. init-memtable seeds the
+            ;; counter from the replayed WAL's max seq; then fold in the manifest's
+            ;; max-seq so next-seq = max(manifest max-seq, WAL max-seq) + 1. The
+            ;; manifest part is essential: a clean shutdown right after a flush
+            ;; leaves an empty WAL, so the newest seq can live only in SSTables.
+            registry (tx/create-registry)
+            [wal-id memtable-val] (init-memtable (async/chan) registry config)
+            _ (tx/seed-seq! registry (max manifest-max-seq
+                                          (tx/current-seq registry)))
+            memtable (atom memtable-val)
+            ;; Holds the memtable currently being flushed (nil when no flush is in
+            ;; progress). Reads consult it between the mutable memtable and the
+            ;; version, closing the flush-visibility gap (see KVS/select).
+            immutable-memtable (atom nil)
+            ;; serializes the commit-handler's {conflict-check -> seq assign ->
+            ;; enqueue} critical section (see `commit/commit!`)
+            commit-lock (Object.)
+            coordinator (spawn-bg-workers memtable immutable-memtable tree registry
+                                          (atom sstable-id) (atom wal-id) config)
+            kvs (->KVS config memtable immutable-memtable tree registry commit-lock
+                       coordinator directory-locks)]
+        ;; Block until the initial flush has established the first WAL generation
+        ;; (and, on restart, committed the replayed WAL to an SSTable).
+        (when-not (true? (deref (:ready coordinator) INIT_TIMEOUT_MS :timeout))
+          ;; Do not release directory ownership until the partially started workers
+          ;; have stopped.
+          (let [cause @(:poison coordinator)]
+            (close! kvs)
+            (throw (ex-info "Initializing KVS failed" {} cause))))
+        kvs)
+      (catch Throwable e
+        (db-lock/release-all! directory-locks)
+        (throw e)))))
 
 (defn select
   "Read the value corresponding to the given key.
