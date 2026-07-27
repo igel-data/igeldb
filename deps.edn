@@ -25,7 +25,7 @@
            ;; can't go back before it (M6, "other targets").
            :jepsen {:extra-paths ["jepsen"]
                     :extra-deps {io.github.igel-data/jepsen-lite
-                                 {:git/sha "f48c8b6c10023ed7908e70b05cf306dea2912558"}}
+                                 {:git/sha "a7cc859998d7b88237005132080e50dfdb963328"}}
                     :main-opts ["-m" "igeldb.jepsen"]}
 
            ;; The HTTP driver on its own, to poke at by hand. `clojure -M:jepsen
