@@ -66,7 +66,10 @@ directory.
 
 `kill` (**separate process**) is a real `SIGKILL`. No `close!`, no flush, no
 shutdown hook — the store is simply gone, and recovery has to come from what
-actually reached the disk. A recent run:
+actually reached the disk. Its driver uses a 256-byte memtable and rotates the
+manifest after every edit; faults are spaced far enough apart for a flush and
+rotation before the next kill, so recovery includes rotated manifests rather
+than only the WAL. A recent run:
 
 ```
 set kill:  1958 acknowledged writes, 0 lost, 5 kills

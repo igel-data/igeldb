@@ -244,7 +244,11 @@
                         :url     url
                         :log     (str dir File/separator "driver.log")}}
       nemesis (assoc :nemesis nemesis)
-      ;; Restarting a JVM takes about a second, so a run needs a clock to run
+      ;; A restart takes about two seconds. Leave a healthy window after it so
+      ;; acknowledged writes can flush and rotate the manifest before the next
+      ;; SIGKILL; otherwise consecutive faults only test connection refusal.
+      nemesis (assoc :nemesis-opts {:fault-interval 3})
+      ;; Restarting a JVM takes about two seconds, so a run needs a clock to run
       ;; against or the kills land after the workload has finished.
       true (assoc :time-limit (or time-limit (if nemesis 15 5))))))
 

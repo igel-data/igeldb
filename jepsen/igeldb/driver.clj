@@ -231,9 +231,9 @@
 
 (defn config-path!
   "IgelDB is configured from a YAML file, so write one into the data directory.
-   Small memtable and a short sync window, so that a few hundred ops flush,
-   compact and have to be recovered -- a run that never left the memtable would
-   not be testing much.
+   A tiny memtable and one-edit manifest rotation threshold make even a short
+   crash run flush and rotate manifests. That puts manifest replacement and
+   recovery in the SIGKILL window instead of merely testing WAL replay.
 
    Written the same way every time, because a restart after a crash has to open
    the store it left behind."
@@ -242,7 +242,8 @@
         path (io/file dir "config.yaml")]
     (spit path (str "sstable-dir: " (.getPath (io/file dir "sstable")) "\n"
                     "wal-dir: " (.getPath (io/file dir "wal")) "\n"
-                    "memtable-size: 16384\n"
+                    "memtable-size: 256\n"
+                    "manifest-rotation-edits: 1\n"
                     "sync-window-time: 5\n"))
     (.getPath path)))
 

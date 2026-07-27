@@ -21,6 +21,9 @@
   "Long enough that a healthy store never trips it."
   (Duration/ofSeconds 5))
 
+(def ^:private default-refusal-threshold 8)
+(def ^:private default-refusal-backoff-ms 50)
+
 (defn- refused?
   "Did the connection never get made? Then the operation certainly did not
    happen, which is a `fail!` and not an `info!`."
@@ -29,6 +32,15 @@
     (cond (nil? t)                       false
           (instance? ConnectException t) true
           :else                          (recur (.getCause t)))))
+
+(defn- backoff-after-refusal!
+  "Stops a dead target from turning a short run into tens of thousands of
+   immediate failures. The counter lives on the shared connection, so the
+   threshold applies to all workers together rather than once per worker."
+  [{:keys [consecutive-refusals refusal-threshold refusal-backoff-ms]}]
+  (let [n (swap! consecutive-refusals inc)]
+    (when (> n refusal-threshold)
+      (Thread/sleep (long refusal-backoff-ms)))))
 
 (defn- post
   "One request to the driver, mapped onto the outcomes a handler can signal:
@@ -48,7 +60,8 @@
    in flight may or may not have been committed before the process went. Saying
    `:info` there is not vagueness -- it is the only honest answer, and the
    checkers know what to do with it."
-  [{:keys [^HttpClient client url ^Duration timeout]} path body]
+  [{:keys [^HttpClient client url ^Duration timeout consecutive-refusals]
+    :as conn} path body]
   (let [request (-> (HttpRequest/newBuilder (URI/create (str url path)))
                     (.timeout timeout)
                     (.header "Content-Type" "application/edn")
@@ -56,12 +69,17 @@
                     (.build))
         ^HttpResponse response
         (try
-          (.send client request (HttpResponse$BodyHandlers/ofString))
+          (let [response (.send client request
+                                (HttpResponse$BodyHandlers/ofString))]
+            ;; Any response, including a 4xx/5xx, proves the target is reachable.
+            (reset! consecutive-refusals 0)
+            response)
           (catch HttpTimeoutException _
             (info! {:timeout path}))
           (catch IOException e
             (if (refused? e)
-              (fail! {:connection-refused path})
+              (do (backoff-after-refusal! conn)
+                  (fail! {:connection-refused path}))
               (info! {:io path, :message (ex-message e)}))))
         status (.statusCode response)
         parsed (edn/read-string (.body response))]
@@ -70,7 +88,8 @@
       (<= 400 status 499) (fail! (:error parsed))
       :else               (info! {:status status, :error (:error parsed)}))))
 
-(defrecord Adapter [handler url request-timeout]
+(defrecord Adapter [handler url request-timeout
+                    refusal-threshold refusal-backoff-ms]
   client/ClientAdapter
   (open [_]
     ;; A client against the running driver. Note what is absent: nothing is
@@ -79,6 +98,9 @@
     ;; crash a question worth asking.
     {:url     url
      :timeout (or request-timeout default-request-timeout)
+     :consecutive-refusals (atom 0)
+     :refusal-threshold (or refusal-threshold default-refusal-threshold)
+     :refusal-backoff-ms (or refusal-backoff-ms default-refusal-backoff-ms)
      :client  (-> (HttpClient/newBuilder)
                   (.connectTimeout (Duration/ofSeconds 2))
                   (.build))})
