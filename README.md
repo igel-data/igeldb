@@ -93,12 +93,21 @@ com.igel-data/igeldb {:mvn/version "1.0.0"}
      (igel/scan kvs from-key to-key))
 ; -> (["key1" "val1"])
 
+;; Atomically read and update multiple keys. with-tx commits on success and
+;; rolls back if its body throws.
+(igel/with-tx [tx kvs]
+  (let [current (String. (igel/tx-get tx key1))]
+    (igel/tx-put tx key1 (.getBytes (str current "-updated")))
+    (igel/tx-put tx (.getBytes "key5") (.getBytes "val5"))))
+
 ;; Close the store when done: flushes and releases resources.
 ;; After close!, reads and writes are rejected.
 (igel/close! kvs)
 ```
 
 Keys and values are `byte[]`. Serialize your own values to bytes before writing.
+`with-tx` does not automatically retry write conflicts; retry the whole transaction
+when conflict handling is appropriate for your application.
 
 ### Babashka
 
