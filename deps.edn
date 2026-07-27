@@ -19,8 +19,18 @@
                    :ns-default build}
 
            ;; Verify IgelDB with jepsen-lite. Kept off the main deps (it drags in
-           ;; all of Jepsen). Run: clojure -M:jepsen [workload...] [crash]
+           ;; all of Jepsen). Run: clojure -M:jepsen [workload...] [crash|kill]
+           ;;
+           ;; `kill` needs jepsen-lite's :local-process target-type, so this sha
+           ;; can't go back before it (M6, "other targets").
            :jepsen {:extra-paths ["jepsen"]
                     :extra-deps {io.github.igel-data/jepsen-lite
-                                 {:git/sha "769af933f0976932715016782c62e41c6cd01ba3"}}
-                    :main-opts ["-m" "igeldb.jepsen"]}}}
+                                 {:git/sha "f48c8b6c10023ed7908e70b05cf306dea2912558"}}
+                    :main-opts ["-m" "igeldb.jepsen"]}
+
+           ;; The HTTP driver on its own, to poke at by hand. `clojure -M:jepsen
+           ;; ... kill` starts and kills one of these itself.
+           :jepsen-driver {:extra-paths ["jepsen"]
+                           :extra-deps {io.github.igel-data/jepsen-lite
+                                        {:git/sha "f48c8b6c10023ed7908e70b05cf306dea2912558"}}
+                           :main-opts ["-m" "igeldb.driver"]}}}

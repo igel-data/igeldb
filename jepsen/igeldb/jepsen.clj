@@ -17,20 +17,37 @@
    Run:  clojure -M:jepsen                 ; bank + register + set + counter
          clojure -M:jepsen bank            ; one workload
          clojure -M:jepsen set crash       ; with the crash nemesis
+         clojure -M:jepsen set kill        ; a real kill -9 -- see below
          clojure -M:jepsen bank time=10    ; run for 10 seconds
 
-   NOTE on :crash -- an :in-process 'crash' is `close!` + reopen, i.e. a CLEAN
-   shutdown and recovery, not a `kill -9`. It exercises IgelDB's recovery path and
-   the durability of already-acknowledged writes across a restart; it does NOT
-   test a hard power-loss mid-fsync (that needs a :local-process target, which
-   jepsen-lite doesn't run yet). Closing cleanly is required because IgelDB's
-   background threads must stop before the store is reopened on the same dir."
+   Two kinds of crash, and the difference matters:
+
+   :crash (:in-process)  `close!` + reopen -- a CLEAN shutdown and recovery. It
+     exercises WAL replay / manifest recovery and the durability of
+     already-acknowledged writes across a restart. Closing cleanly is required
+     here because IgelDB's background threads must stop before the store is
+     reopened on the same dir.
+
+   kill (:local-process) IgelDB runs in a separate process -- `igeldb.driver`,
+     which embeds it behind a small HTTP API -- and jepsen-lite SIGKILLs that
+     process mid-run and starts it again. No `close!`, no flush, no shutdown
+     hook: recovery has to come from what actually reached the disk. The
+     handlers move to `igeldb.client`, which speaks HTTP; everything else --
+     workloads, checkers, outcome signalling -- is unchanged, because a
+     target's protocol and its deployment are separate axes in jepsen-lite.
+
+     What it still does NOT test is loss of writes the OS took but never
+     flushed: SIGKILL kills the process, not the page cache. That needs power
+     loss or a filesystem fault injector."
   (:require [clojure.java.io :as jio]
             [clojure.string :as str]
             [clj-yaml.core :as yaml]
+            [igeldb.client :as igel-client]
             [igeldb.core :as igel]
             [lite.client :as client]
-            [lite.core :as core]))
+            [lite.core :as core])
+  (:import (java.io File)
+           (java.net ServerSocket)))
 
 ;; ---- byte-array (de)serialization ----------------------------------------
 ;; IgelDB keys and values are byte arrays; the workloads use integers.
@@ -183,30 +200,85 @@
       (and nemesis (not time-limit))
       (assoc :nemesis-opts {:crashes 8 :crash-interval 1/500}))))
 
+;; ---- kill -9: IgelDB as a separate process --------------------------------
+;;
+;; The same workloads against the same store, with one difference: IgelDB is
+;; running in a process of its own, and jepsen-lite is holding the handle. The
+;; adapter changes because the protocol does (HTTP, not method calls); the
+;; target changes because the deployment does. Nothing else moves.
+
+(defn- free-port []
+  (with-open [socket (ServerSocket. 0)]
+    (.getLocalPort socket)))
+
+(defn- driver-command
+  "An ordinary command line: this JVM, this classpath, the driver's -main.
+   The program itself and not a shell wrapper -- jepsen-lite signals what it
+   started, and a shell would take the signal instead of the store."
+  [port data-dir]
+  [(str (System/getProperty "java.home") File/separator "bin"
+        File/separator "java")
+   "-cp" (System/getProperty "java.class.path")
+   "clojure.main" "-m" "igeldb.driver"
+   "--port"     (str port)
+   "--data-dir" data-dir])
+
+(defn kill-config
+  "A run config for `workload` against IgelDB in a killable process."
+  [workload {:keys [nemesis time-limit]}]
+  (let [dir  (str "./jepsen-data/kill-" (name workload))
+        port (free-port)
+        url  (str "http://127.0.0.1:" port)]
+    ;; A clean directory per run, before anything starts. That is this
+    ;; namespace's job, not jepsen-lite's: it starts and kills the process, but
+    ;; what it starts it on is ours -- and a crash test means nothing if the
+    ;; data it is meant to recover was the last run's.
+    (rm-rf dir)
+    (.mkdirs (jio/file dir))
+    (cond-> {:adapter  (igel-client/map->Adapter {:url url})
+             :handler  (get igel-client/handlers workload)
+             :workload workload
+             :name     (str "igeldb-kill-" (name workload))
+             :target   {:type    :local-process
+                        :command (driver-command port dir)
+                        :url     url
+                        :log     (str dir File/separator "driver.log")}}
+      nemesis (assoc :nemesis nemesis)
+      ;; Restarting a JVM takes about a second, so a run needs a clock to run
+      ;; against or the kills land after the workload has finished.
+      true (assoc :time-limit (or time-limit (if nemesis 15 5))))))
+
 (defn run-workload
   "Run one workload and return jepsen-lite's verdict map."
-  [workload opts]
+  [workload {:keys [kill?] :as opts}]
   (println (str "\n==== " (name workload)
+                (when kill? " (separate process)")
                 (when (seq (:nemesis opts)) (str " " (str/join " " (map name (:nemesis opts)))))
                 " ===="))
-  (core/run (config workload opts)))
+  (core/run (if kill?
+              (kill-config workload opts)
+              (config workload opts))))
 
 (defn- parse-args
-  "Words in any order: workload names (default: all four), `crash`, and
-   `time=<seconds>`."
+  "Words in any order: workload names (default: all four), `crash`, `kill`,
+   and `time=<seconds>`."
   [args]
   (let [flags     (set (remove #(str/includes? % "=") args))
         settings  (into {} (map #(str/split % #"=" 2))
                         (filter #(str/includes? % "=") args))
         chosen    (filterv (comp flags name) (keys handlers))
-        workloads (if (seq chosen) chosen [:bank :register :set :counter])]
+        workloads (if (seq chosen) chosen [:bank :register :set :counter])
+        kill?     (boolean (flags "kill"))]
     [workloads (cond-> {}
-                 (flags "crash") (assoc :nemesis [:crash])
+                 kill? (assoc :kill? true)
+                 ;; `kill` means the fault too: a separate process with nothing
+                 ;; killing it would just be a slower in-process run.
+                 (or (flags "crash") kill?) (assoc :nemesis [:crash])
                  (some-> (get settings "time") parse-long)
                  (assoc :time-limit (parse-long (get settings "time"))))]))
 
 (defn -main
-  "clojure -M:jepsen [workload...] [crash] [time=<seconds>]"
+  "clojure -M:jepsen [workload...] [crash] [kill] [time=<seconds>]"
   [& args]
   (let [[workloads opts] (parse-args args)
         results (doall (for [w workloads]
