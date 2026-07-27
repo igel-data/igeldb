@@ -7,6 +7,14 @@ native binary. Just add it to your classpath.
 Built on an LSM tree with leveled compaction, IgelDB persists every write to disk and is
 designed to be crash-safe: durability isn't an afterthought but a tested property.
 
+## Installation
+
+Add IgelDB to `deps.edn`:
+
+```clojure
+com.igel-data/igeldb {:mvn/version "1.0.0"}
+```
+
 ## Why IgelDB
 
 - **Drop-in for Babashka.** Unlike stores that ship a native binary (and reintroduce the
@@ -23,6 +31,9 @@ designed to be crash-safe: durability isn't an afterthought but a tested propert
   hundreds-of-GB workloads, reach for RocksDB — IgelDB targets the embedded niche.
 - **Concurrent reads.** Readers work against an immutable snapshot with no locking, so reads
   proceed concurrently with writes and compaction.
+- **ACID transactions.** Multi-key transactions provide snapshot isolation with
+  first-committer-wins conflict detection. Snapshot isolation is not serializability:
+  transactions whose write sets do not overlap can still exhibit write skew.
 
 ## Design
 
@@ -113,6 +124,11 @@ Configuration is a YAML file (see `gen-kvs`). Key parameters:
 Manifest format v1 uses `CURRENT` to select a generational
 `MANIFEST-<generation>` file. Earlier unversioned `MANIFEST` files are rejected;
 they are not upgraded automatically.
+
+IgelDB's crash tests use process termination (`SIGKILL`). They verify recovery
+from WALs, SSTables, and rotated manifests, but do not simulate sudden power loss:
+the operating system may still retain acknowledged filesystem writes in its page
+cache after a process is killed.
 
 An open IgelDB instance exclusively owns both configured storage directories.
 Opening another instance that shares either directory fails until the first

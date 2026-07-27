@@ -1,43 +1,49 @@
-# Change Log
-All notable changes to this project will be documented in this file. This change log follows the conventions of [keepachangelog.com](http://keepachangelog.com/).
+# Changelog
+
+All notable changes to this project are documented here. This changelog follows
+[Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-07-27
+
+Initial stable release.
+
 ### Added
-- **Babashka compatibility.** IgelDB now loads and runs under Babashka (bb) as a
-  pure-Clojure library — no pod, no native binary. See `test/bb_smoke.clj`.
-- Explicit `igeldb.core/close!` to shut a store down (replaces the removed
-  `Object.finalize` hook, which was unreliable and unsupported under bb's SCI).
+
+- Embeddable, pure-Clojure LSM-tree key-value store for the JVM and Babashka.
+- Durable WAL-backed writes, immutable memtables, SSTables, bloom filters, and
+  leveled compaction.
+- ACID multi-key transactions with snapshot isolation and first-committer-wins
+  write-conflict detection.
+- Synchronous `close!` and exclusive ownership of configured storage
+  directories.
+- Versioned WAL, SSTable, and generational manifest formats with crash recovery
+  and manifest rotation.
+- Jepsen verification of snapshot isolation, register linearizability, and
+  acknowledged-write durability across graceful restarts and `SIGKILL`.
 
 ### Changed
-- Manifest edit encoding: Fressian → the project's own binary format (inside the
-  unchanged Phase 1 length+CRC frame).
-- Bloom filters: `blossom 1.1.0` → `2.0.0` (zero-dependency, `byte[]` API).
-- Internal representation swaps (behavior unchanged, verified by the JVM suite):
-  the memtable is now an immutable `sorted-map` behind an atom (lock-free reads,
-  fixing the old concurrent-read defect); the reader/deletion lock is a
-  `Semaphore`; fsync uses `FileChannel.force(true)`.
+
+- Manifest edit encoding now uses IgelDB's binary format inside its length-and-CRC
+  frame instead of Fressian.
+- Bloom filters use Blossom 2's zero-dependency `byte[]` API.
+- The memtable is an immutable sorted map behind an atom, allowing lock-free
+  reads.
+- Filesystem durability uses `FileChannel.force(true)`.
 
 ### Removed
-- `org.clojure/data.fressian` dependency.
 
-> **Migration:** a data directory written before this change is not readable
-> afterward (manifest edit encoding and bloom serialization both changed). There
-> are no external users yet, so no compatibility shim is provided.
+- The `org.clojure/data.fressian` dependency.
 
-## [0.1.1] - 2023-08-12
-### Changed
-- Documentation on how to make the widgets.
+### Compatibility and limitations
 
-### Removed
-- `make-widget-sync` - we're all async, all the time.
+- Snapshot isolation is not serializability; write skew remains possible when
+  concurrent transactions update disjoint keys.
+- Data directories written by the earlier unversioned storage format are
+  rejected and are not upgraded automatically.
+- `SIGKILL` crash tests do not model sudden power loss or loss of data retained
+  only in the operating system's page cache.
 
-### Fixed
-- Fixed widget maker to keep working when daylight savings switches over.
-
-## 0.1.0 - 2023-08-12
-### Added
-- Files from the new template.
-- Widget maker public API - `make-widget-sync`.
-
-[Unreleased]: https://sourcehost.site/your-name/kvs/compare/0.1.1...HEAD
-[0.1.1]: https://sourcehost.site/your-name/kvs/compare/0.1.0...0.1.1
+[Unreleased]: https://github.com/igel-data/igeldb/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/igel-data/igeldb/releases/tag/v1.0.0

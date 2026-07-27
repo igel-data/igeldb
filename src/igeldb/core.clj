@@ -35,7 +35,7 @@
 (defrecord Coordinator [flush-req-chan compaction-req-chan poison ready
                         stall-monitor worker-chans])
 
-(defn spawn-bg-workers
+(defn- spawn-bg-workers
   [memtable immutable-memtable tree registry sstable-id wal-id config]
   (let [flush-req-chan (async/chan)
         flush-wal-chan (async/chan)
