@@ -1,3 +1,5 @@
+[![IgelDB](https://img.shields.io/clojars/v/com.igel-data/igeldb.svg)](https://clojars.org/com.igel-data/igeldb)
+
 # IgelDB
 
 An embeddable key-value store for the Clojure ecosystem — pure Clojure, zero native
