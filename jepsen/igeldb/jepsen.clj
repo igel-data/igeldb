@@ -18,9 +18,11 @@
          clojure -M:jepsen bank            ; one workload
          clojure -M:jepsen set crash       ; with the crash nemesis
          clojure -M:jepsen set kill        ; a real kill -9 -- see below
+         clojure -M:jepsen set power-off   ; kill -9 with the unfsynced writes
+                                           ; dropped first (Linux + lazyfs)
          clojure -M:jepsen bank time=10    ; run for 10 seconds
 
-   Two kinds of crash, and the difference matters:
+   Three kinds of crash, and the differences matter:
 
    :crash (:in-process)  `close!` + reopen -- a CLEAN shutdown and recovery. It
      exercises WAL replay / manifest recovery and the durability of
@@ -37,8 +39,24 @@
      target's protocol and its deployment are separate axes in jepsen-lite.
 
      What it still does NOT test is loss of writes the OS took but never
-     flushed: SIGKILL kills the process, not the page cache. That needs power
-     loss or a filesystem fault injector."
+     flushed: SIGKILL kills the process, not the page cache. A store that
+     fsyncs what it acknowledges and one that merely write()s it come through
+     a kill identically.
+
+   power-off (:local-process + lazyfs)  the same separate process, with the
+     filesystem under its data directory replaced by lazyfs -- a FUSE
+     filesystem that holds writes in a cache of its own until an fsync. Each
+     fault clears that cache (and waits for lazyfs to confirm) before the
+     SIGKILL, so IgelDB restarts on a disk that lost precisely the writes it
+     never made durable. This is the fault that actually asks whether the WAL
+     fsync before a commit is acknowledged (`igeldb.wal/commit-batch!`) is
+     doing its job -- and whether the files and directory entries it depends on
+     were fsynced too.
+
+     Linux only, and it needs /dev/fuse and a built lazyfs checkout; point
+     JEPSEN_LITE_LAZYFS (or `lazyfs=<dir>`) at it. Anywhere else jepsen-lite
+     stops the run and says what is missing rather than quietly running a plain
+     kill, which would report durability nobody tested."
   (:require [clojure.java.io :as jio]
             [clojure.string :as str]
             [clj-yaml.core :as yaml]
@@ -165,6 +183,11 @@
     (when (.isDirectory f) (doseq [c (.listFiles f)] (rm-rf c)))
     (.delete f)))
 
+(defn- canonical
+  "`path` as the kernel would name it: absolute, with no `.` left in it."
+  [path]
+  (.getCanonicalPath (jio/file path)))
+
 (defn- fresh-config!
   "A clean data dir + config for one run; returns the config path. A small
    memtable makes a few hundred ops flush and compact, so the run exercises the
@@ -200,12 +223,16 @@
       (and nemesis (not time-limit))
       (assoc :nemesis-opts {:crashes 8 :crash-interval 1/500}))))
 
-;; ---- kill -9: IgelDB as a separate process --------------------------------
+;; ---- kill -9 and power-off: IgelDB as a separate process ------------------
 ;;
 ;; The same workloads against the same store, with one difference: IgelDB is
 ;; running in a process of its own, and jepsen-lite is holding the handle. The
 ;; adapter changes because the protocol does (HTTP, not method calls); the
 ;; target changes because the deployment does. Nothing else moves.
+;;
+;; :power-off is the same target again plus four lines of `:lazyfs`. The
+;; workloads, the handlers, the adapter and the checkers are untouched -- what
+;; changes is the filesystem IgelDB's data directory sits on.
 
 (defn- free-port []
   (with-open [socket (ServerSocket. 0)]
@@ -224,33 +251,65 @@
    "--data-dir" data-dir])
 
 (defn kill-config
-  "A run config for `workload` against IgelDB in a killable process."
-  [workload {:keys [nemesis time-limit]}]
-  (let [dir  (str "./jepsen-data/kill-" (name workload))
+  "A run config for `workload` against IgelDB in a killable process. With
+   `:power-off` among the intents, that process runs on a lazyfs mount."
+  [workload {:keys [nemesis time-limit lazyfs-dir]}]
+  (let [power-off? (boolean (some #{:power-off} nemesis))
+        base (str "./jepsen-data/" (if power-off? "poweroff-" "kill-")
+                  (name workload))
+        ;; With a power-off the data directory has to *be* the lazyfs mount:
+        ;; that is the only place lazyfs can see IgelDB's writes, and a store
+        ;; writing anywhere else would sail through every power-off with
+        ;; nothing dropped -- a durability test that passes having tested
+        ;; nothing. Everything jepsen-lite and lazyfs need for themselves (the
+        ;; FIFOs, the toml, the logs) stays in `base`, beside the mount and not
+        ;; under it: a FIFO behind the filesystem being set up is unopenable.
+        dir  (if power-off? (str base File/separator "data") base)
         port (free-port)
         url  (str "http://127.0.0.1:" port)]
     ;; A clean directory per run, before anything starts. That is this
     ;; namespace's job, not jepsen-lite's: it starts and kills the process, but
     ;; what it starts it on is ours -- and a crash test means nothing if the
     ;; data it is meant to recover was the last run's.
-    (rm-rf dir)
+    (rm-rf base)
     (.mkdirs (jio/file dir))
     (cond-> {:adapter  (igel-client/map->Adapter {:url url})
              :handler  (get igel-client/handlers workload)
              :workload workload
-             :name     (str "igeldb-kill-" (name workload))
-             :target   {:type    :local-process
-                        :command (driver-command port dir)
-                        :url     url
-                        :log     (str dir File/separator "driver.log")}}
+             :name     (str "igeldb-" (if power-off? "poweroff-" "kill-")
+                            (name workload))
+             :target   (cond-> {:type    :local-process
+                                :command (driver-command port dir)
+                                :url     url
+                                :log     (str base File/separator "driver.log")}
+                         power-off?
+                         (assoc :lazyfs
+                                {:dir         (or lazyfs-dir
+                                                  (System/getenv "JEPSEN_LITE_LAZYFS"))
+                                 ;; Canonical, not merely absolute. jepsen-lite
+                                 ;; waits for the mount by looking the path up in
+                                 ;; the mount table, and the kernel lists what it
+                                 ;; mounted -- `/home/me/igel/jepsen-data/...`.
+                                 ;; A path still carrying this namespace's `./`
+                                 ;; is absolute and correct and matches nothing
+                                 ;; there, so the mount succeeds and the run
+                                 ;; gives up waiting for it.
+                                 :mount-point (canonical dir)
+                                 :root        (canonical
+                                               (str base File/separator "root"))}))}
       nemesis (assoc :nemesis nemesis)
       ;; A restart takes about two seconds. Leave a healthy window after it so
       ;; acknowledged writes can flush and rotate the manifest before the next
       ;; SIGKILL; otherwise consecutive faults only test connection refusal.
       nemesis (assoc :nemesis-opts {:fault-interval 3})
       ;; Restarting a JVM takes about two seconds, so a run needs a clock to run
-      ;; against or the kills land after the workload has finished.
-      true (assoc :time-limit (or time-limit (if nemesis 15 5))))))
+      ;; against or the kills land after the workload has finished. A power-off
+      ;; gets longer still: every op goes through FUSE, and each fault waits for
+      ;; lazyfs to confirm the cache was cleared before the kill.
+      true (assoc :time-limit (or time-limit
+                                  (cond power-off? 30
+                                        nemesis    15
+                                        :else      5))))))
 
 (defn run-workload
   "Run one workload and return jepsen-lite's verdict map."
@@ -265,28 +324,47 @@
 
 (defn- parse-args
   "Words in any order: workload names (default: all four), `crash`, `kill`,
-   and `time=<seconds>`."
+   `power-off`, and settings as key=value -- `time=<seconds>`,
+   `lazyfs=<dir>`."
   [args]
   (let [flags     (set (remove #(str/includes? % "=") args))
         settings  (into {} (map #(str/split % #"=" 2))
                         (filter #(str/includes? % "=") args))
         chosen    (filterv (comp flags name) (keys handlers))
         workloads (if (seq chosen) chosen [:bank :register :set :counter])
-        kill?     (boolean (flags "kill"))]
+        ;; `power-off` is a :local-process fault, so asking for it means the
+        ;; separate process too -- there is nothing else to power off.
+        kill?     (boolean (or (flags "kill") (flags "power-off")))
+        intents   (cond-> []
+                    ;; `kill` means the fault as well: a separate process with
+                    ;; nothing killing it would just be a slower in-process run.
+                    (or (flags "crash") (flags "kill")) (conj :crash)
+                    (flags "power-off")                 (conj :power-off))]
     [workloads (cond-> {}
                  kill? (assoc :kill? true)
-                 ;; `kill` means the fault too: a separate process with nothing
-                 ;; killing it would just be a slower in-process run.
-                 (or (flags "crash") kill?) (assoc :nemesis [:crash])
+                 (seq intents) (assoc :nemesis intents)
+                 (get settings "lazyfs") (assoc :lazyfs-dir (get settings "lazyfs"))
                  (some-> (get settings "time") parse-long)
                  (assoc :time-limit (parse-long (get settings "time"))))]))
 
 (defn -main
-  "clojure -M:jepsen [workload...] [crash] [kill] [time=<seconds>]"
+  "clojure -M:jepsen [workload...] [crash] [kill] [power-off]
+                     [time=<seconds>] [lazyfs=<dir>]"
   [& args]
   (let [[workloads opts] (parse-args args)
-        results (doall (for [w workloads]
-                         [w (:valid? (run-workload w opts))]))]
+        results (try
+                  (doall (for [w workloads]
+                           [w (:valid? (run-workload w opts))]))
+                  (catch clojure.lang.ExceptionInfo e
+                    ;; jepsen-lite's own refusals -- a fault the target-type
+                    ;; can't inject, no lazyfs on this host -- already say what
+                    ;; is wrong and how to fix it. A stack trace on top would
+                    ;; only bury the explanation.
+                    (if (:lite/error (ex-data e))
+                      (do (println (str "\n" (ex-message e)))
+                          (shutdown-agents)
+                          (System/exit 2))
+                      (throw e))))]
     (println "\n==== summary ====")
     (doseq [[w valid?] results]
       (println (format "  %-10s :valid? %s" (name w) (pr-str valid?))))

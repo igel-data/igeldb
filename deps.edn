@@ -19,17 +19,25 @@
                    :ns-default build}
 
            ;; Verify IgelDB with jepsen-lite. Kept off the main deps (it drags in
-           ;; all of Jepsen). Run: clojure -M:jepsen [workload...] [crash|kill]
+           ;; all of Jepsen). Run:
+           ;;   clojure -M:jepsen [workload...] [crash|kill|power-off]
            ;;
            ;; `kill` needs jepsen-lite's :local-process target-type, so this sha
-           ;; can't go back before it (M6, "other targets").
+           ;; can't go back before it (M6, "other targets"); `power-off` needs
+           ;; the lazyfs mount on top of it, which is this sha exactly. A git
+           ;; dep and not :mvn/version because the newest release (0.1.0)
+           ;; predates it -- and the :git/url is spelled out because the lib
+           ;; name isn't one the CLI can infer a URL from.
            :jepsen {:extra-paths ["jepsen"]
-                    :extra-deps {com.igel-data/jepsen-lite {:mvn/version "0.1.0"}}
+                    :extra-deps {com.igel-data/jepsen-lite
+                                 {:git/url "https://github.com/igel-data/jepsen-lite.git"
+                                  :git/sha "07ecb2fa3395d003f621366c8720801922d7b16e"}}
                     :main-opts ["-m" "igeldb.jepsen"]}
 
            ;; The HTTP driver on its own, to poke at by hand. `clojure -M:jepsen
            ;; ... kill` starts and kills one of these itself.
            :jepsen-driver {:extra-paths ["jepsen"]
                            :extra-deps {com.igel-data/jepsen-lite
-                                        {:mvn/version  "0.1.0"}}
+                                        {:git/url "https://github.com/igel-data/jepsen-lite.git"
+                                         :git/sha "07ecb2fa3395d003f621366c8720801922d7b16e"}}
                            :main-opts ["-m" "igeldb.driver"]}}}
