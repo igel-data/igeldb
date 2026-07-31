@@ -17,24 +17,39 @@ Fault-injection / consistency verification of IgelDB with
 The workloads, the checkers and the verdicts are identical in all three. What
 differs is the adapter (the protocol IgelDB is reached by) and the target-type
 (how it is deployed) — which is jepsen-lite's whole design premise, and the
-reason `kill` cost a driver and a client rather than a second test suite, and
-`power-off` cost four lines of `:lazyfs` on top of that.
+reason the separate process cost a driver and a client rather than a second
+test suite, and `power-off` cost four lines of `:lazyfs` on top of that.
 
 ## Run
 
 ```sh
-clojure -M:jepsen               # bank + register + set + counter
-clojure -M:jepsen bank          # one workload
-clojure -M:jepsen set crash     # in-process: close! + reopen
-clojure -M:jepsen set kill      # separate process: a real kill -9
-clojure -M:jepsen set power-off # ... with the unfsynced writes dropped first
-clojure -M:jepsen bank time=10  # run for 10 seconds
+clojure -M:jepsen                                       # every workload
+clojure -M:jepsen --workload bank                       # one of them
+clojure -M:jepsen --workload set --fault crash          # in-process: close! + reopen
+clojure -M:jepsen --profile process --workload set --fault crash      # kill -9
+clojure -M:jepsen --profile process --workload set --fault power-off  # + fsync
+clojure -M:jepsen --profile process --workload counter --fault pause  # SIGSTOP
+clojure -M:jepsen --workload bank --time-limit 30 --concurrency 8
+clojure -M:jepsen --help
 ```
 
-Exits non-zero if any workload's verdict is `:valid? false`.
+The command line is jepsen-lite's own: `lite.runner` takes the suite
+`igeldb.jepsen/suite` declares — workloads, profiles, and the one
+IgelDB-specific option (`--lazyfs`) — and owns the parsing, the repetition over
+workloads, the summary and the exit status. Exits non-zero if any verdict is
+`:valid? false`, and 2 if jepsen-lite refused the run.
 
-`time=<seconds>` sets jepsen-lite's `:time-limit`. A timed run continues for
-that duration instead of ending after the workload's default operation count.
+| flag | |
+|---|---|
+| `--workload NAME` | `bank`, `register`, `set`, `counter`; may be repeated |
+| `--profile NAME` | `in-process` (default) or `process` |
+| `--fault NAME` | `crash`, `pause`, `power-off`; may be repeated |
+| `--time-limit N` | run for N seconds instead of a fixed op count |
+| `--concurrency N` | workers issuing ops |
+| `--lazyfs PATH` | a built lazyfs checkout, for `--fault power-off` |
+
+Which faults a profile can inject is jepsen-lite's business, not ours: asking
+`in-process` for a `power-off` stops the run with what went wrong and why.
 
 | workload | checks | IgelDB feature exercised |
 |---|---|---|
@@ -64,13 +79,13 @@ workloads are the end-to-end gate. Keep both green.
 
 ## Three kinds of crash, and what each proves
 
-`crash` (**in-process**) is `close!` + reopen: a *clean* shutdown and recovery.
-It exercises WAL replay and manifest recovery and the durability of
+`--fault crash` on **`in-process`** is `close!` + reopen: a *clean* shutdown and
+recovery. It exercises WAL replay and manifest recovery and the durability of
 acknowledged writes across a restart. Closing cleanly is required there, because
 IgelDB's background threads must stop before the store is reopened on the same
 directory.
 
-`kill` (**separate process**) is a real `SIGKILL`. No `close!`, no flush, no
+The same fault on **`--profile process`** is a real `SIGKILL`. No `close!`, no flush, no
 shutdown hook — the store is simply gone, and recovery has to come from what
 actually reached the disk. Its driver uses a 256-byte memtable and rotates the
 manifest after every edit; faults are spaced far enough apart for a flush and
@@ -78,7 +93,7 @@ rotation before the next kill, so recovery includes rotated manifests rather
 than only the WAL. A recent run:
 
 ```
-set kill:  1958 acknowledged writes, 0 lost, 5 kills
+process / set / crash:  1958 acknowledged writes, 0 lost, 5 kills
            8 more came back :info (the connection died mid-request) and turned
            out to have been committed — reported as `recovered`, not as errors
 ```
@@ -98,8 +113,11 @@ files it names depend on.
 
 ```sh
 # Linux, /dev/fuse, and a built lazyfs checkout
-JEPSEN_LITE_LAZYFS=/path/to/lazyfs/lazyfs clojure -M:jepsen set power-off
-clojure -M:jepsen set power-off lazyfs=/path/to/lazyfs/lazyfs   # or inline
+JEPSEN_LITE_LAZYFS=/path/to/lazyfs/lazyfs \
+  clojure -M:jepsen --profile process --workload set --fault power-off
+# or inline
+clojure -M:jepsen --profile process --workload set --fault power-off \
+  --lazyfs /path/to/lazyfs/lazyfs
 ```
 
 Anywhere else — macOS, a container without `--device /dev/fuse` — jepsen-lite
@@ -125,20 +143,30 @@ request provably never arrived), while a connection dropped mid-request is an
 
 | file | what it is |
 |---|---|
-| `igeldb/jepsen.clj` | the runner, plus the in-process adapter and handlers |
+| `igeldb/jepsen.clj` | the suite: the two config builders, the in-process adapter and handlers |
 | `igeldb/driver.clj` | IgelDB behind an HTTP API — the process that gets killed |
 | `igeldb/client.clj` | the adapter and handlers that speak to that driver |
 
 None of it is part of IgelDB proper; it is test code, and it uses nothing a
-jepsen-lite user couldn't. Each `kill` or `power-off` run gets a clean data
-directory under `jepsen-data/` before it starts — a crash test means nothing if
-what it recovers turns out to be the previous run's.
+jepsen-lite user couldn't. What is *not* here is as much to the point: no
+argument parsing, no summary, no exit-status logic, no HTTP-connection
+lifecycle, and no unpacking of workload ops — `lite.runner`, `lite.client` and
+`lite.handlers` own those, and a handler is now one function per operation
+(`(fn [conn key old new] ...)` for a CAS) rather than a `case` over `:f`.
+Getting those op shapes right by hand is easy to get subtly wrong: the counter
+checker wants the increment and not the new total, and a CAS mismatch has to be
+reported as *exactly* `false`.
 
-A `power-off` run lays that directory out in three parts, because lazyfs needs
+Every run gets a directory of its own under `jepsen-data/<label>/<timestamp>-<uuid>/`,
+created fresh and never reused — a crash test means nothing if what it recovers
+turns out to be the previous run's. Nothing is deleted, so old runs accumulate
+until you remove them.
+
+A `power-off` run lays its directory out in three parts, because lazyfs needs
 somewhere to stand:
 
 ```
-jepsen-data/poweroff-<workload>/
+jepsen-data/poweroff-<workload>/<run>/
   data/     the lazyfs mount — IgelDB's data directory, and the only place
             lazyfs can see its writes
   root/     what lazyfs actually writes through to

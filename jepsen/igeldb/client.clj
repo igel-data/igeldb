@@ -1,6 +1,6 @@
 (ns igeldb.client
-  "The other half of the `kill -9` setup: a jepsen-lite ClientAdapter that
-   speaks HTTP to `igeldb.driver`, and one handler per workload.
+  "The other half of the separate-process setup: a jepsen-lite ClientAdapter
+   that speaks HTTP to `igeldb.driver`, and one handler per workload.
 
    Compare it with the in-process adapter in `igeldb.jepsen`. The handlers there
    call IgelDB directly; these make an HTTP request instead. Everything else --
@@ -9,7 +9,8 @@
    and the way it is deployed are separate concerns in jepsen-lite. This
    namespace is the protocol half; the target-type is the other."
   (:require [clojure.edn :as edn]
-            [lite.client :as client :refer [fail! info!]])
+            [lite.client :as client :refer [fail! info!]]
+            [lite.handlers :as handlers])
   (:import (java.io IOException)
            (java.net ConnectException URI)
            (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
@@ -88,75 +89,56 @@
       (<= 400 status 499) (fail! (:error parsed))
       :else               (info! {:status status, :error (:error parsed)}))))
 
-(defrecord Adapter [handler url request-timeout
-                    refusal-threshold refusal-backoff-ms]
-  client/ClientAdapter
-  (open [_]
-    ;; A client against the running driver. Note what is absent: nothing is
-    ;; created, started or seeded here. The store's data was on disk before
-    ;; this connection existed -- which is what makes reopening it after a
-    ;; crash a question worth asking.
-    {:url     url
-     :timeout (or request-timeout default-request-timeout)
-     :consecutive-refusals (atom 0)
-     :refusal-threshold (or refusal-threshold default-refusal-threshold)
-     :refusal-backoff-ms (or refusal-backoff-ms default-refusal-backoff-ms)
-     :client  (-> (HttpClient/newBuilder)
-                  (.connectTimeout (Duration/ofSeconds 2))
-                  (.build))})
+(defn adapter
+  "An adapter which connects to the IgelDB driver's HTTP API.
 
-  (invoke [_ conn op]
-    (client/complete handler conn op))
-
-  (close [_ conn]
-    ;; Tolerate a nil or already-closed conn: `close` is re-runnable.
-    (when-let [c (:client conn)]
-      (when (instance? java.lang.AutoCloseable c)
-        (.close ^java.lang.AutoCloseable c)))))
+   Note what `open` does not do: nothing is created, started or seeded. The
+   store's data was on disk before this connection existed -- which is what
+   makes reopening it after a crash a question worth asking."
+  [{:keys [url request-timeout refusal-threshold refusal-backoff-ms]}]
+  (client/adapter
+   {:open
+    (fn []
+      {:url     url
+       :timeout (or request-timeout default-request-timeout)
+       :consecutive-refusals (atom 0)
+       :refusal-threshold (or refusal-threshold default-refusal-threshold)
+       :refusal-backoff-ms (or refusal-backoff-ms default-refusal-backoff-ms)
+       :client  (-> (HttpClient/newBuilder)
+                    (.connectTimeout (Duration/ofSeconds 2))
+                    (.build))})
+    :close
+    (fn [conn]
+      ;; Tolerate an already-closed conn: `close` is re-runnable.
+      (when-let [c (:client conn)]
+        (when (instance? java.lang.AutoCloseable c)
+          (.close ^java.lang.AutoCloseable c))))}))
 
 ;; ---- handlers -------------------------------------------------------------
-
-(defn- register-handler
-  [conn {:keys [f key value]}]
-  (case f
-    :read  (post conn "/read" {:key key})
-    :write (post conn "/write" {:key key, :value value})
-    :cas   (let [[old new] value]
-             ;; A mismatch comes back 409 and `post` calls fail! -- an ordinary
-             ;; failed op, not a violation. On success return the pair the op
-             ;; carried: the checker's model reads `[old new]` off the
-             ;; completed op.
-             (post conn "/cas" {:key key, :old old, :new new})
-             value)))
-
-(defn- set-handler
-  [conn {:keys [f value]}]
-  (case f
-    :add  (post conn "/append" {:key :elements, :element value})
-    :read (or (post conn "/read-collection" {:key :elements}) [])))
-
-(defn- counter-handler
-  [conn {:keys [f value]}]
-  (case f
-    ;; Return the increment, not the running total the store hands back: the
-    ;; checker reads the amount off the completed op.
-    :add  (do (post conn "/add" {:key :counter, :amount value})
-              value)
-    :read (long (or (post conn "/read" {:key :counter}) 0))))
-
-(defn- bank-handler
-  [conn {:keys [f value]}]
-  (case f
-    ;; The opening balances, from the workload's first phase, over the wire
-    ;; like any other op. The handler doesn't know they are special, and the
-    ;; store doesn't know it is a bank.
-    :init     (post conn "/write-all" {:values value})
-    :read     (post conn "/read-all" {})
-    :transfer (post conn "/transfer" value)))
+;;
+;; `lite.handlers` unpacks each workload's ops and returns what its checker
+;; expects -- which is not always what the driver hands back, and getting that
+;; wrong by hand is easy: a counter's checker wants the increment, not the new
+;; total, and a CAS's wants the `[old new]` pair the op carried.
 
 (def handlers
   "Workload -> the handler that speaks HTTP for it."
-  {:register register-handler
-   :bank     bank-handler
-   :set      set-handler
-   :counter  counter-handler})
+  {:register (handlers/register
+              ;; A mismatch comes back 409 and `post` calls fail! -- an
+              ;; ordinary failed op, not a violation.
+              {:read  #(post %1 "/read" {:key %2})
+               :write #(post %1 "/write" {:key %2, :value %3})
+               :cas   #(post %1 "/cas" {:key %2, :old %3, :new %4})})
+   :bank     (handlers/bank
+              ;; The opening balances go over the wire like any other op. The
+              ;; handler doesn't know they are special, and the store doesn't
+              ;; know it is a bank.
+              {:init     #(post %1 "/write-all" {:values %2})
+               :read     #(post % "/read-all" {})
+               :transfer #(post %1 "/transfer" {:from %2, :to %3, :amount %4})})
+   :set      (handlers/set
+              {:add  #(post %1 "/append" {:key :elements, :element %2})
+               :read #(post % "/read-collection" {:key :elements})})
+   :counter  (handlers/counter
+              {:add  #(post %1 "/add" {:key :counter, :amount %2})
+               :read #(post % "/read" {:key :counter})})})

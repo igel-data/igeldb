@@ -19,25 +19,18 @@
                    :ns-default build}
 
            ;; Verify IgelDB with jepsen-lite. Kept off the main deps (it drags in
-           ;; all of Jepsen). Run:
-           ;;   clojure -M:jepsen [workload...] [crash|kill|power-off]
-           ;;
-           ;; `kill` needs jepsen-lite's :local-process target-type, so this sha
-           ;; can't go back before it (M6, "other targets"); `power-off` needs
-           ;; the lazyfs mount on top of it, which is this sha exactly. A git
-           ;; dep and not :mvn/version because the newest release (0.1.0)
-           ;; predates it -- and the :git/url is spelled out because the lib
-           ;; name isn't one the CLI can infer a URL from.
+           ;; all of Jepsen). `clojure -M:jepsen --help` for the CLI, which is
+           ;; jepsen-lite's own: `lite.runner` runs the suite that
+           ;; `igeldb.jepsen` declares.
            :jepsen {:extra-paths ["jepsen"]
                     :extra-deps {com.igel-data/jepsen-lite
                                  {:git/url "https://github.com/igel-data/jepsen-lite.git"
-                                  :git/sha "07ecb2fa3395d003f621366c8720801922d7b16e"}}
-                    :main-opts ["-m" "igeldb.jepsen"]}
+                                  :git/sha "3951f778d052b5a2180f6f06860b5a2a45781e89"}}
+                    :main-opts ["-m" "lite.runner" "igeldb.jepsen/suite"]}
 
            ;; The HTTP driver on its own, to poke at by hand. `clojure -M:jepsen
-           ;; ... kill` starts and kills one of these itself.
+           ;; --profile process` starts and kills one of these itself. It needs
+           ;; no jepsen-lite at all -- the driver is a program in its own right,
+           ;; and must be runnable, and killable, without it anywhere near.
            :jepsen-driver {:extra-paths ["jepsen"]
-                           :extra-deps {com.igel-data/jepsen-lite
-                                        {:git/url "https://github.com/igel-data/jepsen-lite.git"
-                                         :git/sha "07ecb2fa3395d003f621366c8720801922d7b16e"}}
                            :main-opts ["-m" "igeldb.driver"]}}}

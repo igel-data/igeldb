@@ -36,4 +36,4 @@ jobs:
           ${{ runner.os }}-jepsen-
 
     - name: Run bank and register tests
-      run: clojure -M:jepsen bank register
+      run: clojure -M:jepsen --workload bank --workload register
